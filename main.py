@@ -2,6 +2,7 @@ import os
 import re
 import time
 import html
+import requests
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Header, HTTPException, Response
@@ -10,205 +11,191 @@ from fastapi.responses import StreamingResponse
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
+# ==============================
+# ENV
+# ==============================
+
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 STRING_SESSION = os.getenv("STRING_SESSION")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
+OMDB_API_KEY = os.getenv("OMDB_API_KEY")
 
-if not API_HASH or not STRING_SESSION or not PUBLIC_BASE_URL:
-    raise RuntimeError("Faltam variáveis de ambiente obrigatórias.")
+if not all([API_HASH, STRING_SESSION, PUBLIC_BASE_URL, OMDB_API_KEY]):
+    raise RuntimeError("Faltam variáveis de ambiente.")
 
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
 CHUNK_SIZE = 1024 * 1024
 MESSAGE_LIMIT = 1000
-
 MESSAGES_CACHE_TTL = 180
 SEARCH_CACHE_TTL = 600
 
-messages_cache = {
-    "expires_at": 0,
-    "items": []
-}
-
+messages_cache = {"expires_at": 0, "items": []}
 search_cache = {}
 
 
-def now_ts() -> float:
+# ==============================
+# HELPERS
+# ==============================
+
+def now_ts():
     return time.time()
 
 
-def normalize_text(text: str) -> str:
+def normalize_text(text: str):
     if not text:
         return ""
     text = html.unescape(text).lower()
     text = text.replace("_", " ").replace(".", " ").replace("-", " ")
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def cleanup_search_cache():
-    current = now_ts()
-    expired_keys = [k for k, v in search_cache.items() if v["expires_at"] < current]
-    for k in expired_keys:
-        del search_cache[k]
+    now = now_ts()
+    for k in list(search_cache):
+        if search_cache[k]["expires_at"] < now:
+            del search_cache[k]
 
 
-def get_cached_search(cache_key: str):
+def get_cached(key):
     cleanup_search_cache()
-    entry = search_cache.get(cache_key)
-    if not entry:
-        return None
-    if entry["expires_at"] < now_ts():
-        del search_cache[cache_key]
-        return None
-    return entry["value"]
+    if key in search_cache:
+        return search_cache[key]["value"]
+    return None
 
 
-def set_cached_search(cache_key: str, value):
-    search_cache[cache_key] = {
+def set_cached(key, value):
+    search_cache[key] = {
         "value": value,
         "expires_at": now_ts() + SEARCH_CACHE_TTL
     }
 
 
-def parse_range_header(range_header: str | None, file_size: int) -> tuple[int, int]:
-    if not range_header:
-        return 0, file_size - 1
-
-    m = re.match(r"bytes=(\d*)-(\d*)$", range_header.strip())
-    if not m:
-        raise HTTPException(status_code=416, detail="Range inválido")
-
-    start_str, end_str = m.groups()
-
-    if start_str == "" and end_str == "":
-        raise HTTPException(status_code=416, detail="Range inválido")
-
-    if start_str == "":
-        suffix_length = int(end_str)
-        if suffix_length <= 0:
-            raise HTTPException(status_code=416, detail="Range inválido")
-        start = max(file_size - suffix_length, 0)
-        end = file_size - 1
-    else:
-        start = int(start_str)
-        if start >= file_size:
-            raise HTTPException(status_code=416, detail="Range fora do arquivo")
-        end = file_size - 1 if end_str == "" else int(end_str)
-
-    end = min(end, file_size - 1)
-
-    if start > end:
-        raise HTTPException(status_code=416, detail="Range inválido")
-
-    return start, end
-
-
-def parse_series_id(stremio_id: str):
+def parse_series_id(sid):
     try:
-        imdb_id, season, episode = stremio_id.split(":")
-        return imdb_id, int(season), int(episode)
-    except Exception:
+        imdb, season, episode = sid.split(":")
+        return imdb, int(season), int(episode)
+    except:
         return None, None, None
 
 
-async def fetch_messages():
-    current = now_ts()
+def parse_range_header(range_header, size):
+    if not range_header:
+        return 0, size - 1
 
-    if messages_cache["expires_at"] > current and messages_cache["items"]:
+    m = re.match(r"bytes=(\d*)-(\d*)$", range_header)
+    if not m:
+        raise HTTPException(416)
+
+    s, e = m.groups()
+    start = int(s) if s else 0
+    end = int(e) if e else size - 1
+
+    if start > end or start >= size:
+        raise HTTPException(416)
+
+    return start, min(end, size - 1)
+
+
+# ==============================
+# OMDB
+# ==============================
+
+def get_movie_title(imdb_id):
+    try:
+        r = requests.get(
+            f"http://www.omdbapi.com/?i={imdb_id}&apikey={OMDB_API_KEY}"
+        ).json()
+        if r.get("Response") == "True":
+            return r.get("Title", ""), r.get("Year", "")
+    except:
+        pass
+    return "", ""
+
+
+# ==============================
+# TELEGRAM CACHE
+# ==============================
+
+async def fetch_messages():
+    if messages_cache["expires_at"] > now_ts():
         return messages_cache["items"]
 
     entity = await client.get_entity(CHANNEL_ID)
     msgs = await client.get_messages(entity, limit=MESSAGE_LIMIT)
 
     items = []
-    for msg in msgs:
-        text = msg.message or ""
+    for m in msgs:
         items.append({
-            "id": msg.id,
-            "text": text,
-            "normalized_text": normalize_text(text),
-            "has_media": bool(msg.video or msg.document),
+            "id": m.id,
+            "text": m.message or "",
+            "norm": normalize_text(m.message or ""),
+            "media": bool(m.video or m.document)
         })
 
     messages_cache["items"] = items
-    messages_cache["expires_at"] = current + MESSAGES_CACHE_TTL
+    messages_cache["expires_at"] = now_ts() + MESSAGES_CACHE_TTL
     return items
 
 
-async def find_series_message(stremio_id: str):
-    cache_key = f"series:{stremio_id}"
-    cached = get_cached_search(cache_key)
-    if cached is not None:
-        return cached
+# ==============================
+# FINDERS
+# ==============================
 
-    _, season, episode = parse_series_id(stremio_id)
-    if season is None:
-        set_cached_search(cache_key, None)
-        return None
+async def find_series(sid):
+    cache = get_cached(f"series:{sid}")
+    if cache is not None:
+        return cache
 
+    _, season, episode = parse_series_id(sid)
     tag = f"s{season:02d}e{episode:02d}"
-    msgs = await fetch_messages()
 
-    for msg in msgs:
-        if not msg["has_media"]:
-            continue
+    for m in await fetch_messages():
+        if m["media"] and tag in m["norm"]:
+            set_cached(f"series:{sid}", m)
+            return m
 
-        text = msg["normalized_text"]
-
-        if tag in text:
-            set_cached_search(cache_key, msg)
-            return msg
-
-    set_cached_search(cache_key, None)
+    set_cached(f"series:{sid}", None)
     return None
 
 
-async def find_movie_message(stremio_id: str):
-    cache_key = f"movie:{stremio_id}"
-    cached = get_cached_search(cache_key)
-    if cached is not None:
-        return cached
+async def find_movie(mid):
+    cache = get_cached(f"movie:{mid}")
+    if cache is not None:
+        return cache
 
-    msgs = await fetch_messages()
+    title, year = get_movie_title(mid)
+    title = normalize_text(title)
 
     best = None
-    best_score = -1
+    score = 0
 
-    for msg in msgs:
-        if not msg["has_media"]:
+    for m in await fetch_messages():
+        if not m["media"]:
             continue
 
-        text = msg["normalized_text"]
-        score = 0
+        s = 0
+        if title and title in m["norm"]:
+            s += 100
+        if year and year in m["norm"]:
+            s += 20
 
-        if "#movie" in text or "#filme" in text:
-            score += 20
+        if s > score:
+            score = s
+            best = m
 
-        if len(text) > 4:
-            score += 5
-
-        if any(str(y) in text for y in range(1950, 2031)):
-            score += 5
-
-        if score > best_score:
-            best_score = score
-            best = msg
-
-    if not best:
-        for msg in msgs:
-            if msg["has_media"]:
-                best = msg
-                break
-
-    set_cached_search(cache_key, best)
+    set_cached(f"movie:{mid}", best)
     return best
 
 
+# ==============================
+# APP
+# ==============================
+
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app):
     print("Conectando ao Telegram...")
     await client.start()
     print("Telegram conectado")
@@ -221,146 +208,83 @@ app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-@app.api_route("/", methods=["GET", "HEAD"])
+@app.get("/")
 def home():
-    return {
-        "status": "ok",
-        "version": "2.7.1"
-    }
+    return {"status": "ok"}
 
 
 @app.get("/manifest.json")
 def manifest():
     return {
         "id": "org.telaverde.telegram",
-        "version": "2.7.1",
+        "version": "3.0.0",
         "name": "TelaVerde",
-        "description": "Streaming direto do Telegram V2.1",
+        "description": "Telegram + OMDb",
         "logo": "https://i.imgur.com/7z9QZ6P.png",
         "resources": ["stream"],
         "types": ["movie", "series"],
         "idPrefixes": ["tt"],
-        "catalogs": [],
-        "behaviorHints": {
-            "configurable": False
-        }
+        "catalogs": []
     }
 
 
-@app.get("/video/{msg_id}")
-async def video(msg_id: int, range: str | None = Header(default=None)):
+@app.get("/video/{mid}")
+async def video(mid: int, range: str | None = Header(None)):
     entity = await client.get_entity(CHANNEL_ID)
-    msg = await client.get_messages(entity, ids=msg_id)
+    msg = await client.get_messages(entity, ids=mid)
 
-    if not msg or not msg.media or not getattr(msg, "file", None):
-        raise HTTPException(status_code=404, detail="Mídia não encontrada")
+    size = msg.file.size
+    start, end = parse_range_header(range, size)
+    length = end - start + 1
+    limit = (length + CHUNK_SIZE - 1) // CHUNK_SIZE
 
-    file_size = int(msg.file.size)
-    filename = msg.file.name if getattr(msg.file, "name", None) else f"video_{msg.id}.mp4"
-
-    start, end = parse_range_header(range, file_size)
-    content_length = end - start + 1
-    limit_chunks = (content_length + CHUNK_SIZE - 1) // CHUNK_SIZE
-
-    async def streamer():
-        bytes_sent = 0
-        async for chunk in client.iter_download(
+    async def stream():
+        sent = 0
+        async for c in client.iter_download(
             msg.media,
             offset=start,
             chunk_size=CHUNK_SIZE,
             request_size=CHUNK_SIZE,
-            limit=limit_chunks,
-            file_size=file_size,
+            limit=limit
         ):
-            if isinstance(chunk, memoryview):
-                chunk = chunk.tobytes()
-
-            remaining = content_length - bytes_sent
-            if remaining <= 0:
+            c = bytes(c)
+            r = length - sent
+            if r <= 0:
                 break
-
-            piece = chunk[:remaining]
-            bytes_sent += len(piece)
-            yield piece
-
-            if bytes_sent >= content_length:
-                break
-
-    headers = {
-        "Accept-Ranges": "bytes",
-        "Content-Disposition": f'inline; filename="{filename}"',
-        "Content-Length": str(content_length),
-        "Content-Range": f"bytes {start}-{end}/{file_size}",
-    }
+            p = c[:r]
+            sent += len(p)
+            yield p
 
     return StreamingResponse(
-        streamer(),
-        status_code=206 if range else 200,
-        media_type="video/mp4",
-        headers=headers,
+        stream(),
+        206,
+        headers={
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(length),
+            "Content-Range": f"bytes {start}-{end}/{size}"
+        }
     )
 
 
-@app.head("/video/{msg_id}")
-async def video_head(msg_id: int, range: str | None = Header(default=None)):
-    entity = await client.get_entity(CHANNEL_ID)
-    msg = await client.get_messages(entity, ids=msg_id)
-
-    if not msg or not msg.media or not getattr(msg, "file", None):
-        raise HTTPException(status_code=404, detail="Mídia não encontrada")
-
-    file_size = int(msg.file.size)
-    filename = msg.file.name if getattr(msg.file, "name", None) else f"video_{msg.id}.mp4"
-    start, end = parse_range_header(range, file_size)
-    content_length = end - start + 1
-
-    headers = {
-        "Accept-Ranges": "bytes",
-        "Content-Disposition": f'inline; filename="{filename}"',
-        "Content-Length": str(content_length),
-        "Content-Range": f"bytes {start}-{end}/{file_size}",
-        "Content-Type": "video/mp4",
-    }
-
-    return Response(status_code=206 if range else 200, headers=headers)
-
-
 @app.get("/stream/{type}/{id}.json")
-async def stream(type: str, id: str):
+async def stream(type, id):
     if type == "series":
-        found = await find_series_message(id)
-        if not found:
-            return {"streams": []}
+        m = await find_series(id)
+    else:
+        m = await find_movie(id)
 
-        return {
-            "streams": [
-                {
-                    "name": "TelaVerde",
-                    "title": found["text"] or "Episódio",
-                    "url": f"{PUBLIC_BASE_URL}/video/{found['id']}"
-                }
-            ]
-        }
+    if not m:
+        return {"streams": []}
 
-    if type == "movie":
-        found = await find_movie_message(id)
-        if not found:
-            return {"streams": []}
-
-        return {
-            "streams": [
-                {
-                    "name": "TelaVerde",
-                    "title": found["text"] or "Filme",
-                    "url": f"{PUBLIC_BASE_URL}/video/{found['id']}"
-                }
-            ]
-        }
-
-    return {"streams": []}
+    return {
+        "streams": [{
+            "name": "TelaVerde",
+            "title": m["text"],
+            "url": f"{PUBLIC_BASE_URL}/video/{m['id']}"
+        }]
+    }
