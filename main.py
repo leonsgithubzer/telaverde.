@@ -18,7 +18,7 @@ STRING_SESSION = os.getenv("STRING_SESSION")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
 TMDB_BEARER_TOKEN = os.getenv("TMDB_BEARER_TOKEN")
 
-if not all([API_ID, API_HASH, CHANNEL_ID, STRING_SESSION, PUBLIC_BASE_URL, TMDB_BEARER_TOKEN]):
+if not all([API_ID, API_HASH, CHANNEL_ID, STRING_SESSION, PUBLIC_BASE_URL]):
     raise RuntimeError("Faltam variáveis de ambiente obrigatórias.")
 
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
@@ -36,7 +36,7 @@ tmdb_cache = {}
 TMDB_HEADERS = {
     "Authorization": f"Bearer {TMDB_BEARER_TOKEN}",
     "accept": "application/json",
-}
+} if TMDB_BEARER_TOKEN else {}
 
 
 def now_ts():
@@ -48,8 +48,7 @@ def normalize_text(text: str):
         return ""
     text = html.unescape(text).lower()
     text = text.replace("_", " ").replace(".", " ").replace("-", " ").replace(":", " ")
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def cleanup_cache(store):
@@ -100,8 +99,7 @@ def token_variants(title: str):
     norm = normalize_text(title)
     if not norm:
         return []
-    tokens = [w for w in norm.split() if len(w) > 2]
-    return list(dict.fromkeys(tokens))
+    return [w for w in norm.split() if len(w) > 2]
 
 
 def score_against_queries(queries, text, year=None, kind="movie"):
@@ -143,6 +141,9 @@ def score_against_queries(queries, text, year=None, kind="movie"):
 
 
 def tmdb_find_by_imdb(imdb_id):
+    if not TMDB_BEARER_TOKEN:
+        return {}
+
     cached = get_cached(tmdb_cache, imdb_id)
     if cached is not None:
         return cached
@@ -264,7 +265,7 @@ async def find_series(series_id):
             best_score = score
             best = m
 
-    if best_score < 120:
+    if best_score < 100:
         best = None
 
     set_cached(search_cache, f"series:{series_id}", best, SEARCH_CACHE_TTL)
@@ -295,8 +296,25 @@ async def find_movie(movie_id):
             best_score = score
             best = m
 
+    # fallback se TMDb falhar ou não achar nada forte
     if best_score < 60:
-        best = None
+        fallback = None
+
+        # tenta pelo ano
+        if year:
+            for m in msgs:
+                if m["media"] and year in m["norm"]:
+                    fallback = m
+                    break
+
+        # se ainda não achou e não tem títulos do TMDb, volta pra primeira mídia recente
+        if not fallback and not title_queries:
+            for m in msgs:
+                if m["media"]:
+                    fallback = m
+                    break
+
+        best = fallback
 
     set_cached(search_cache, f"movie:{movie_id}", best, SEARCH_CACHE_TTL)
     return best
@@ -324,14 +342,14 @@ app.add_middleware(
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def home():
-    return {"status": "ok", "version": "4.0.0"}
+    return {"status": "ok", "version": "4.1.0"}
 
 
 @app.get("/manifest.json")
 def manifest():
     return {
         "id": "org.telaverde.telegram",
-        "version": "4.0.0",
+        "version": "4.1.0",
         "name": "TelaVerde",
         "description": "Telegram + TMDb pt-BR",
         "logo": "https://i.imgur.com/7z9QZ6P.png",
