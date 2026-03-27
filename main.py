@@ -1,3 +1,4 @@
+import os
 import re
 from contextlib import asynccontextmanager
 
@@ -7,11 +8,11 @@ from fastapi.responses import StreamingResponse
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
-API_ID = 35059370
-API_HASH = "54e519c023c83d37c3b4133d873c8599"
-CHANNEL_ID = -1003375515891
-STRING_SESSION = "1AZWarzYBu5kFWhDc3HRiOxWWsNRv7oXu00-Z81Dt3wQPMX4xa92B4lDtKeKSMopkeVCVqhbDUUg5P3hlyjzhI41IJFT2lykgyns3s4R6RZXVDS1Kv_MyKO8_xiiDCUpRfvz5ROBhGnh4VAxmO8sWYD35yM35jUQ3AXNrNFt6WYygf-r-TmT2EfmzwiJRViSpstyKoiHvO9HxogFwMrzgd0L1M7B7UJzyuxc-w4joFP_1gvAwYf1sevBgFeXKWRemUrRn5TKfJ3XB5bTi60-nhaL8Zcbvg0Kyic8XPoLTgJaA-GR4ezLAQotO2YFGkh-BqLlTCaIwP8zMAe6_NUVUKsIrxs9jdLY="
-PUBLIC_BASE_URL = "https://telaverde.onrender.com"
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
+STRING_SESSION = os.getenv("STRING_SESSION")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
 
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
