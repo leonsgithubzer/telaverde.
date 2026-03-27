@@ -12,7 +12,9 @@ API_ID = 35059370
 API_HASH = "54e519c023c83d37c3b4133d873c8599"
 CHANNEL_ID = -1003375515891
 STRING_SESSION = "1AZWarzYBu5kFWhDc3HRiOxWWsNRv7oXu00-Z81Dt3wQPMX4xa92B4lDtKeKSMopkeVCVqhbDUUg5P3hlyjzhI41IJFT2lykgyns3s4R6RZXVDS1Kv_MyKO8_xiiDCUpRfvz5ROBhGnh4VAxmO8sWYD35yM35jUQ3AXNrNFt6WYygf-r-TmT2EfmzwiJRViSpstyKoiHvO9HxogFwMrzgd0L1M7B7UJzyuxc-w4joFP_1gvAwYf1sevBgFeXKWRemUrRn5TKfJ3XB5bTi60-nhaL8Zcbvg0Kyic8XPoLTgJaA-GR4ezLAQotO2YFGkh-BqLlTCaIwP8zMAe6_NUVUKsIrxs9jdLY="
-PUBLIC_BASE_URL = "https://placeholder.onrender.com"
+
+# 🔥 AGORA COM URL CERTA
+PUBLIC_BASE_URL = "https://telaverde.onrender.com"
 
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
@@ -21,9 +23,9 @@ CHUNK_SIZE = 1024 * 512
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("Conectando...")
+    print("Conectando ao Telegram...")
     await client.start()
-    print("Conectado")
+    print("Telegram conectado")
     yield
     await client.disconnect()
 
