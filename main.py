@@ -2,6 +2,7 @@ import os
 import re
 import time
 import html
+import traceback
 import requests
 from contextlib import asynccontextmanager
 
@@ -142,6 +143,7 @@ def score_against_queries(queries, text, year=None, kind="movie"):
 
 def tmdb_find_by_imdb(imdb_id):
     if not TMDB_BEARER_TOKEN:
+        print("TMDB_BEARER_TOKEN não configurado")
         return {}
 
     cached = get_cached(tmdb_cache, imdb_id)
@@ -156,8 +158,11 @@ def tmdb_find_by_imdb(imdb_id):
 
     try:
         res = requests.get(url, headers=TMDB_HEADERS, params=params, timeout=15)
+        print("TMDb status:", res.status_code)
         data = res.json()
-    except Exception:
+        print(f"TMDb find {imdb_id}: {data}")
+    except Exception as e:
+        print(f"Erro TMDb em {imdb_id}: {e}")
         data = {}
 
     set_cached(tmdb_cache, imdb_id, data, TMDB_CACHE_TTL)
@@ -181,10 +186,12 @@ def get_movie_metadata(imdb_id):
     release_date = movie.get("release_date", "")
     year = release_date[:4] if release_date else ""
 
-    return {
+    meta = {
         "titles": list(dict.fromkeys(titles)),
         "year": year
     }
+    print(f"Metadata filme {imdb_id}: {meta}")
+    return meta
 
 
 def get_series_metadata(imdb_id):
@@ -201,9 +208,9 @@ def get_series_metadata(imdb_id):
         if value:
             titles.append(value)
 
-    return {
-        "titles": list(dict.fromkeys(titles))
-    }
+    meta = {"titles": list(dict.fromkeys(titles))}
+    print(f"Metadata série {imdb_id}: {meta}")
+    return meta
 
 
 async def fetch_messages():
@@ -265,7 +272,9 @@ async def find_series(series_id):
             best_score = score
             best = m
 
-    if best_score < 100:
+    print(f"Série {series_id} -> score {best_score}, match: {best['text'] if best else None}")
+
+    if best_score < 80:
         best = None
 
     set_cached(search_cache, f"series:{series_id}", best, SEARCH_CACHE_TTL)
@@ -296,18 +305,17 @@ async def find_movie(movie_id):
             best_score = score
             best = m
 
-    # fallback se TMDb falhar ou não achar nada forte
-    if best_score < 60:
+    print(f"Filme {movie_id} -> títulos {title_queries}, ano {year}, score {best_score}, match: {best['text'] if best else None}")
+
+    if best_score < 35:
         fallback = None
 
-        # tenta pelo ano
         if year:
             for m in msgs:
                 if m["media"] and year in m["norm"]:
                     fallback = m
                     break
 
-        # se ainda não achou e não tem títulos do TMDb, volta pra primeira mídia recente
         if not fallback and not title_queries:
             for m in msgs:
                 if m["media"]:
@@ -315,6 +323,7 @@ async def find_movie(movie_id):
                     break
 
         best = fallback
+        print(f"Fallback filme {movie_id}: {best['text'] if best else None}")
 
     set_cached(search_cache, f"movie:{movie_id}", best, SEARCH_CACHE_TTL)
     return best
@@ -342,14 +351,14 @@ app.add_middleware(
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def home():
-    return {"status": "ok", "version": "4.1.0"}
+    return {"status": "ok", "version": "4.1.1"}
 
 
 @app.get("/manifest.json")
 def manifest():
     return {
         "id": "org.telaverde.telegram",
-        "version": "4.1.0",
+        "version": "4.1.1",
         "name": "TelaVerde",
         "description": "Telegram + TMDb pt-BR",
         "logo": "https://i.imgur.com/7z9QZ6P.png",
@@ -441,20 +450,25 @@ async def video_head(mid: int, range: str | None = Header(None)):
 
 @app.get("/stream/{type}/{id}.json")
 async def stream(type, id):
-    if type == "series":
-        m = await find_series(id)
-    else:
-        m = await find_movie(id)
+    try:
+        if type == "series":
+            m = await find_series(id)
+        else:
+            m = await find_movie(id)
 
-    if not m:
+        if not m:
+            return {"streams": []}
+
+        return {
+            "streams": [
+                {
+                    "name": "TelaVerde",
+                    "title": m["text"] or ("Episódio" if type == "series" else "Filme"),
+                    "url": f"{PUBLIC_BASE_URL}/video/{m['id']}"
+                }
+            ]
+        }
+    except Exception as e:
+        print("ERRO NA ROTA /stream:", e)
+        traceback.print_exc()
         return {"streams": []}
-
-    return {
-        "streams": [
-            {
-                "name": "TelaVerde",
-                "title": m["text"] or ("Episódio" if type == "series" else "Filme"),
-                "url": f"{PUBLIC_BASE_URL}/video/{m['id']}"
-            }
-        ]
-    }
