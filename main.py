@@ -25,7 +25,7 @@ if not all([API_ID, API_HASH, CHANNEL_ID, STRING_SESSION, PUBLIC_BASE_URL]):
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
 CHUNK_SIZE = 1024 * 1024
-MESSAGE_LIMIT = 1200
+MESSAGE_LIMIT = 5000
 MESSAGES_CACHE_TTL = 180
 SEARCH_CACHE_TTL = 600
 TMDB_CACHE_TTL = 86400
@@ -221,15 +221,17 @@ async def fetch_messages():
         return cached
 
     entity = await client.get_entity(CHANNEL_ID)
-    msgs = await client.get_messages(entity, limit=MESSAGE_LIMIT)
 
     items = []
-    for m in msgs:
+    async for m in client.iter_messages(entity, limit=MESSAGE_LIMIT):
+        if not (m.video or m.document):
+            continue
+
         items.append({
             "id": m.id,
             "text": m.message or "",
             "norm": normalize_text(m.message or ""),
-            "media": bool(m.video or m.document)
+            "media": True
         })
 
     set_cached(messages_cache, "messages", items, MESSAGES_CACHE_TTL)
