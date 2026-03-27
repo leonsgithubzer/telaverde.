@@ -1,5 +1,7 @@
 import os
 import re
+import time
+import html
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Header, HTTPException, Response
@@ -14,9 +16,43 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 STRING_SESSION = os.getenv("STRING_SESSION")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
 
+if not API_HASH or not STRING_SESSION or not PUBLIC_BASE_URL:
+    raise RuntimeError("Faltam variáveis de ambiente obrigatórias.")
+
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
 CHUNK_SIZE = 1024 * 1024
+MESSAGE_LIMIT = 300
+
+MESSAGES_CACHE_TTL = 180
+SEARCH_CACHE_TTL = 600
+
+messages_cache = {
+    "expires_at": 0,
+    "items": []
+}
+
+search_cache = {}
+
+
+def now_ts() -> float:
+    return time.time()
+
+
+def normalize_text(text: str) -> str:
+    if not text:
+        return ""
+    text = html.unescape(text).lower()
+    text = text.replace("_", " ").replace(".", " ").replace("-", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def cleanup_search_cache():
+    current = now_ts()
+    expired_keys = [k for k, v in search_cache.items() if v["expires_at"] < current]
+    for k in expired_keys:
+        del search_cache[k]
 
 
 def parse_range_header(range_header: str | None, file_size: int) -> tuple[int, int]:
@@ -52,6 +88,181 @@ def parse_range_header(range_header: str | None, file_size: int) -> tuple[int, i
     return start, end
 
 
+def parse_series_id(stremio_id: str):
+    try:
+        imdb_id, season, episode = stremio_id.split(":")
+        return imdb_id, int(season), int(episode)
+    except Exception:
+        return None, None, None
+
+
+def score_movie_match(query: str, text: str) -> int:
+    score = 0
+
+    q = normalize_text(query)
+    t = normalize_text(text)
+
+    if not q or not t:
+        return score
+
+    if q == t:
+        score += 100
+
+    if q in t:
+        score += 50
+
+    q_words = [w for w in q.split() if len(w) > 2]
+    for word in q_words:
+        if word in t:
+            score += 10
+
+    year_match = re.search(r"(19|20)\d{2}", q)
+    if year_match and year_match.group(0) in t:
+        score += 20
+
+    if "#movie" in t:
+        score += 10
+
+    return score
+
+
+def series_tags(season: int, episode: int):
+    return [
+        f"s{season:02d}e{episode:02d}",
+        f"{season}x{episode:02d}",
+        f"season {season} episode {episode}",
+        f"temporada {season} episodio {episode}",
+        f"temporada {season} episódio {episode}",
+    ]
+
+
+async def fetch_messages():
+    current = now_ts()
+
+    if messages_cache["expires_at"] > current and messages_cache["items"]:
+        return messages_cache["items"]
+
+    entity = await client.get_entity(CHANNEL_ID)
+    msgs = await client.get_messages(entity, limit=MESSAGE_LIMIT)
+
+    items = []
+    for msg in msgs:
+        text = msg.message or ""
+        items.append({
+            "id": msg.id,
+            "text": text,
+            "normalized_text": normalize_text(text),
+            "has_media": bool(msg.video or msg.document),
+        })
+
+    messages_cache["items"] = items
+    messages_cache["expires_at"] = current + MESSAGES_CACHE_TTL
+    return items
+
+
+def get_cached_search(cache_key: str):
+    cleanup_search_cache()
+    entry = search_cache.get(cache_key)
+    if not entry:
+        return None
+    if entry["expires_at"] < now_ts():
+        del search_cache[cache_key]
+        return None
+    return entry["value"]
+
+
+def set_cached_search(cache_key: str, value):
+    search_cache[cache_key] = {
+        "value": value,
+        "expires_at": now_ts() + SEARCH_CACHE_TTL
+    }
+
+
+async def find_series_message(stremio_id: str):
+    cache_key = f"series:{stremio_id}"
+    cached = get_cached_search(cache_key)
+    if cached is not None:
+        return cached
+
+    _, season, episode = parse_series_id(stremio_id)
+    if season is None:
+        set_cached_search(cache_key, None)
+        return None
+
+    tags = series_tags(season, episode)
+    msgs = await fetch_messages()
+
+    best = None
+    best_score = -1
+
+    for msg in msgs:
+        if not msg["has_media"]:
+            continue
+
+        text = msg["normalized_text"]
+        score = 0
+
+        for tag in tags:
+            if tag in text:
+                score += 100
+
+        if "#series" in text:
+            score += 10
+
+        if score > best_score:
+            best_score = score
+            best = msg
+
+    if best_score <= 0:
+        best = None
+
+    set_cached_search(cache_key, best)
+    return best
+
+
+async def find_movie_message(stremio_id: str):
+    cache_key = f"movie:{stremio_id}"
+    cached = get_cached_search(cache_key)
+    if cached is not None:
+        return cached
+
+    msgs = await fetch_messages()
+
+    # tentativa 1: encontrar mensagens com padrão de filme melhor nomeadas
+    # como não temos metadata externa aqui, usamos só o texto disponível no canal
+    best = None
+    best_score = -1
+
+    for msg in msgs:
+        if not msg["has_media"]:
+            continue
+
+        score = 0
+        text = msg["normalized_text"]
+
+        # valorizar mensagens com cara de filme
+        if "#movie" in text:
+            score += 10
+        if any(y in text for y in [str(y) for y in range(1950, 2031)]):
+            score += 5
+        if len(text) > 2:
+            score += 1
+
+        if score > best_score:
+            best_score = score
+            best = msg
+
+    # fallback: primeira mídia
+    if not best:
+        for msg in msgs:
+            if msg["has_media"]:
+                best = msg
+                break
+
+    set_cached_search(cache_key, best)
+    return best
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("Conectando ao Telegram...")
@@ -74,22 +285,27 @@ app.add_middleware(
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def home():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "version": "2.6.0"
+    }
 
 
 @app.get("/manifest.json")
 def manifest():
     return {
         "id": "org.telaverde.telegram",
-        "version": "2.4.0",
+        "version": "2.6.0",
         "name": "TelaVerde",
-        "description": "Streaming direto do Telegram",
+        "description": "Streaming direto do Telegram V2",
         "logo": "https://i.imgur.com/7z9QZ6P.png",
         "resources": ["stream"],
-        "types": ["movie"],
+        "types": ["movie", "series"],
         "idPrefixes": ["tt"],
         "catalogs": [],
-        "behaviorHints": {"configurable": False}
+        "behaviorHints": {
+            "configurable": False
+        }
     }
 
 
@@ -173,19 +389,34 @@ async def video_head(msg_id: int, range: str | None = Header(default=None)):
 
 @app.get("/stream/{type}/{id}.json")
 async def stream(type: str, id: str):
-    entity = await client.get_entity(CHANNEL_ID)
-    msgs = await client.get_messages(entity, limit=10)
+    if type == "series":
+        found = await find_series_message(id)
+        if not found:
+            return {"streams": []}
 
-    for msg in msgs:
-        if msg.video or msg.document:
-            return {
-                "streams": [
-                    {
-                        "name": "TelaVerde",
-                        "title": msg.message or "Filme",
-                        "url": f"{PUBLIC_BASE_URL}/video/{msg.id}"
-                    }
-                ]
-            }
+        return {
+            "streams": [
+                {
+                    "name": "TelaVerde",
+                    "title": found["text"] or "Episódio",
+                    "url": f"{PUBLIC_BASE_URL}/video/{found['id']}"
+                }
+            ]
+        }
+
+    if type == "movie":
+        found = await find_movie_message(id)
+        if not found:
+            return {"streams": []}
+
+        return {
+            "streams": [
+                {
+                    "name": "TelaVerde",
+                    "title": found["text"] or "Filme",
+                    "url": f"{PUBLIC_BASE_URL}/video/{found['id']}"
+                }
+            ]
+        }
 
     return {"streams": []}
