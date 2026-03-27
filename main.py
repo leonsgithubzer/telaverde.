@@ -30,7 +30,7 @@ MESSAGES_CACHE_TTL = 180
 SEARCH_CACHE_TTL = 600
 TMDB_CACHE_TTL = 86400
 
-messages_cache = {"expires_at": 0, "items": []}
+messages_cache = {}
 search_cache = {}
 tmdb_cache = {}
 
@@ -55,8 +55,10 @@ def normalize_text(text: str):
 def cleanup_cache(store):
     now = now_ts()
     for k in list(store.keys()):
-        if store[k]["expires_at"] < now:
-            del store[k]
+        value = store.get(k)
+        if isinstance(value, dict) and "expires_at" in value:
+            if value["expires_at"] < now:
+                del store[k]
 
 
 def get_cached(store, key):
@@ -351,14 +353,14 @@ app.add_middleware(
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def home():
-    return {"status": "ok", "version": "4.1.1"}
+    return {"status": "ok", "version": "4.1.2"}
 
 
 @app.get("/manifest.json")
 def manifest():
     return {
         "id": "org.telaverde.telegram",
-        "version": "4.1.1",
+        "version": "4.1.2",
         "name": "TelaVerde",
         "description": "Telegram + TMDb pt-BR",
         "logo": "https://i.imgur.com/7z9QZ6P.png",
