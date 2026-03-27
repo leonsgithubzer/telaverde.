@@ -114,28 +114,6 @@ def parse_series_id(stremio_id: str):
         return None, None, None
 
 
-def build_series_tags(season: int, episode: int):
-    s2 = f"{season:02d}"
-    e2 = f"{episode:02d}"
-
-    return [
-        f"s{s2}e{e2}",
-        f"{season}x{e2}",
-        f"{season}x{episode}",
-        f"season {season} episode {episode}",
-        f"temporada {season} episodio {episode}",
-        f"temporada {season} episódio {episode}",
-        f"temp {season} ep {episode}",
-        f"temp {season} episodio {episode}",
-        f"temp {season} episódio {episode}",
-        f"t{s2}e{e2}",
-        f"t{season}e{episode}",
-        f"ep {episode}",
-        f"episodio {episode}",
-        f"episódio {episode}",
-    ]
-
-
 async def fetch_messages():
     current = now_ts()
 
@@ -171,51 +149,21 @@ async def find_series_message(stremio_id: str):
         set_cached_search(cache_key, None)
         return None
 
-    tags = build_series_tags(season, episode)
+    tag = f"s{season:02d}e{episode:02d}"
     msgs = await fetch_messages()
-
-    best = None
-    best_score = -1
 
     for msg in msgs:
         if not msg["has_media"]:
             continue
 
         text = msg["normalized_text"]
-        score = 0
 
-        # prioridade total pro formato exato
-        exact_primary = [f"s{season:02d}e{episode:02d}", f"{season}x{episode:02d}", f"{season}x{episode}"]
-        for tag in exact_primary:
-            if tag in text:
-                score += 120
+        if tag in text:
+            set_cached_search(cache_key, msg)
+            return msg
 
-        # formatos alternativos
-        for tag in tags:
-            if tag in text:
-                score += 40
-
-        # bônus se a mensagem parece série
-        if "#series" in text or "#serie" in text:
-            score += 20
-
-        # bônus se menciona temporada
-        if "temporada" in text or "season" in text:
-            score += 10
-
-        # pequena penalidade se o texto é curto demais
-        if len(text) < 5:
-            score -= 10
-
-        if score > best_score:
-            best_score = score
-            best = msg
-
-    if best_score <= 0:
-        best = None
-
-    set_cached_search(cache_key, best)
-    return best
+    set_cached_search(cache_key, None)
+    return None
 
 
 async def find_movie_message(stremio_id: str):
@@ -283,7 +231,7 @@ app.add_middleware(
 def home():
     return {
         "status": "ok",
-        "version": "2.7.0"
+        "version": "2.7.1"
     }
 
 
@@ -291,7 +239,7 @@ def home():
 def manifest():
     return {
         "id": "org.telaverde.telegram",
-        "version": "2.7.0",
+        "version": "2.7.1",
         "name": "TelaVerde",
         "description": "Streaming direto do Telegram V2.1",
         "logo": "https://i.imgur.com/7z9QZ6P.png",
