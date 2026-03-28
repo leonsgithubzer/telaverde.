@@ -26,6 +26,7 @@ client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
 CHUNK_SIZE = 512 * 1024
 REQUEST_SIZE = 512 * 1024
+PREBUFFER_SIZE = 8 * 1024 * 1024  # 8 MB iniciais
 MESSAGE_LIMIT = 5000
 MESSAGES_CACHE_TTL = 1800
 SEARCH_CACHE_TTL = 7200
@@ -279,12 +280,10 @@ def get_movie_metadata(imdb_id):
     release_date = movie.get("release_date", "")
     year = release_date[:4] if release_date else ""
 
-    meta = {
+    return {
         "titles": list(dict.fromkeys(titles)),
         "year": year
     }
-    print(f"Metadata filme {imdb_id}: {meta}")
-    return meta
 
 
 def get_series_metadata(imdb_id):
@@ -301,9 +300,7 @@ def get_series_metadata(imdb_id):
         if value:
             titles.append(value)
 
-    meta = {"titles": list(dict.fromkeys(titles))}
-    print(f"Metadata série {imdb_id}: {meta}")
-    return meta
+    return {"titles": list(dict.fromkeys(titles))}
 
 
 async def fetch_messages():
@@ -466,8 +463,6 @@ async def find_series(series_id):
             best_score = score
             best = item
 
-    print(f"Série {series_id} -> score {best_score}, match: {best['text'] if best else None}")
-
     if best_score < 100:
         best = None
 
@@ -514,8 +509,6 @@ async def find_movie(movie_id):
             best_score = score
             best = item
 
-    print(f"Filme {movie_id} -> títulos {title_queries}, ano {year}, score {best_score}, match: {best['text'] if best else None}")
-
     if best_score < 50:
         fallback = None
 
@@ -529,7 +522,6 @@ async def find_movie(movie_id):
             fallback = candidates[0]
 
         best = fallback
-        print(f"Fallback filme {movie_id}: {best['text'] if best else None}")
 
     set_cached(search_cache, cache_key, best, SEARCH_CACHE_TTL)
     return best
@@ -557,7 +549,7 @@ app.add_middleware(
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def home():
-    return {"status": "ok", "version": "4.3.2"}
+    return {"status": "ok", "version": "4.4.0"}
 
 
 @app.get("/refresh")
@@ -573,9 +565,9 @@ async def refresh():
 def manifest():
     return {
         "id": "org.telaverde.telegram",
-        "version": "4.3.2",
+        "version": "4.4.0",
         "name": "TelaVerde",
-        "description": "Telegram + TMDb + indexed matching",
+        "description": "Telegram + TMDb + prebuffer",
         "logo": "https://i.imgur.com/7z9QZ6P.png",
         "resources": ["stream"],
         "types": ["movie", "series"],
@@ -600,16 +592,59 @@ async def video(mid: int, range: str | None = Header(None)):
 
     start, end = parse_range_header(range, size)
     length = end - start + 1
-    limit = (length + CHUNK_SIZE - 1) // CHUNK_SIZE
+    initial_target = min(length, PREBUFFER_SIZE)
 
     async def stream_chunks():
         sent = 0
+        prebuffer = bytearray()
+
+        # fase 1: monta pré-buffer
+        pre_limit = (initial_target + CHUNK_SIZE - 1) // CHUNK_SIZE
         async for chunk in client.iter_download(
             msg.media,
             offset=start,
             chunk_size=CHUNK_SIZE,
             request_size=REQUEST_SIZE,
-            limit=limit,
+            limit=pre_limit,
+            file_size=size
+        ):
+            if isinstance(chunk, memoryview):
+                chunk = chunk.tobytes()
+            else:
+                chunk = bytes(chunk)
+
+            remaining_pre = initial_target - len(prebuffer)
+            if remaining_pre <= 0:
+                break
+
+            piece = chunk[:remaining_pre]
+            if not piece:
+                break
+
+            prebuffer.extend(piece)
+
+            if len(prebuffer) >= initial_target:
+                break
+
+        if prebuffer:
+            sent += len(prebuffer)
+            yield bytes(prebuffer)
+
+        # fase 2: continua do ponto onde parou
+        next_offset = start + sent
+        remaining_total = length - sent
+
+        if remaining_total <= 0:
+            return
+
+        remain_limit = (remaining_total + CHUNK_SIZE - 1) // CHUNK_SIZE
+
+        async for chunk in client.iter_download(
+            msg.media,
+            offset=next_offset,
+            chunk_size=CHUNK_SIZE,
+            request_size=REQUEST_SIZE,
+            limit=remain_limit,
             file_size=size
         ):
             if isinstance(chunk, memoryview):
