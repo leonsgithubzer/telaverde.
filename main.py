@@ -24,15 +24,15 @@ if not all([API_ID, API_HASH, CHANNEL_ID, STRING_SESSION, PUBLIC_BASE_URL]):
 
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
-CHUNK_SIZE = 4 * 1024 * 1024
-REQUEST_SIZE = 1024 * 1024
+CHUNK_SIZE = 512 * 1024
+REQUEST_SIZE = 512 * 1024
 MESSAGE_LIMIT = 5000
 MESSAGES_CACHE_TTL = 1800
 SEARCH_CACHE_TTL = 7200
 TMDB_CACHE_TTL = 86400
 
 MAX_MOVIE_CANDIDATES = 150
-MAX_SERIES_CANDIDATES = 200
+MAX_SERIES_CANDIDATES = 120
 
 messages_cache = {}
 search_cache = {}
@@ -412,11 +412,11 @@ def rank_series_candidates(candidates, titles, season, episode):
 
     for item in candidates:
         pre_score = 0
-        pre_score += score_series_episode(season, episode, item["text"]) * 2
+        pre_score += score_series_episode(season, episode, item["text"]) * 3
         pre_score += score_against_queries(titles, item["text"], kind="series")
 
         if (season, episode) in item["series_tags"]:
-            pre_score += 60
+            pre_score += 100
 
         if season in item["complete_seasons"]:
             pre_score += 20
@@ -453,14 +453,14 @@ async def find_series(series_id):
 
     for item in candidates:
         score = 0
-        score += score_series_episode(season, episode, item["text"]) * 2
+        score += score_series_episode(season, episode, item["text"]) * 3
         score += score_against_queries(title_queries, item["text"], kind="series")
 
         if (season, episode) in item["series_tags"]:
-            score += 100
+            score += 160
 
         if season in item["complete_seasons"]:
-            score += 40
+            score += 25
 
         if score > best_score:
             best_score = score
@@ -557,7 +557,7 @@ app.add_middleware(
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def home():
-    return {"status": "ok", "version": "4.3.1"}
+    return {"status": "ok", "version": "4.3.2"}
 
 
 @app.get("/refresh")
@@ -573,7 +573,7 @@ async def refresh():
 def manifest():
     return {
         "id": "org.telaverde.telegram",
-        "version": "4.3.1",
+        "version": "4.3.2",
         "name": "TelaVerde",
         "description": "Telegram + TMDb + indexed matching",
         "logo": "https://i.imgur.com/7z9QZ6P.png",
@@ -612,12 +612,19 @@ async def video(mid: int, range: str | None = Header(None)):
             limit=limit,
             file_size=size
         ):
-            chunk = bytes(chunk)
+            if isinstance(chunk, memoryview):
+                chunk = chunk.tobytes()
+            else:
+                chunk = bytes(chunk)
+
             remaining = length - sent
             if remaining <= 0:
                 break
 
             piece = chunk[:remaining]
+            if not piece:
+                break
+
             sent += len(piece)
             yield piece
 
@@ -632,6 +639,7 @@ async def video(mid: int, range: str | None = Header(None)):
             "Content-Length": str(length),
             "Content-Range": f"bytes {start}-{end}/{size}",
             "Content-Disposition": f'inline; filename="{filename}"',
+            "Content-Type": "video/mp4",
             "Cache-Control": "public, max-age=3600",
         },
         media_type="video/mp4"
