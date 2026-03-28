@@ -24,7 +24,8 @@ if not all([API_ID, API_HASH, CHANNEL_ID, STRING_SESSION, PUBLIC_BASE_URL]):
 
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
-CHUNK_SIZE = 2 * 1024 * 1024
+CHUNK_SIZE = 4 * 1024 * 1024
+REQUEST_SIZE = 1024 * 1024
 MESSAGE_LIMIT = 5000
 MESSAGES_CACHE_TTL = 1800
 SEARCH_CACHE_TTL = 7200
@@ -607,7 +608,7 @@ async def video(mid: int, range: str | None = Header(None)):
             msg.media,
             offset=start,
             chunk_size=CHUNK_SIZE,
-            request_size=CHUNK_SIZE,
+            request_size=REQUEST_SIZE,
             limit=limit,
             file_size=size
         ):
