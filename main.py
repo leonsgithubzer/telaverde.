@@ -3,7 +3,6 @@ import re
 import time
 import html
 import traceback
-import requests
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Header, HTTPException, Response
@@ -17,33 +16,21 @@ API_HASH = os.getenv("API_HASH")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 STRING_SESSION = os.getenv("STRING_SESSION")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
-TMDB_BEARER_TOKEN = os.getenv("TMDB_BEARER_TOKEN")
 
 if not all([API_ID, API_HASH, CHANNEL_ID, STRING_SESSION, PUBLIC_BASE_URL]):
     raise RuntimeError("Faltam variáveis de ambiente obrigatórias.")
 
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
-CHUNK_SIZE = 512 * 1024
-REQUEST_SIZE = 512 * 1024
-PREBUFFER_SIZE = 8 * 1024 * 1024  # 8 MB iniciais
-MESSAGE_LIMIT = 5000
-MESSAGES_CACHE_TTL = 1800
-SEARCH_CACHE_TTL = 7200
-TMDB_CACHE_TTL = 86400
-
-MAX_MOVIE_CANDIDATES = 150
-MAX_SERIES_CANDIDATES = 120
+# ULTRA LITE
+CHUNK_SIZE = 128 * 1024
+REQUEST_SIZE = 128 * 1024
+MESSAGE_LIMIT = 500
+MESSAGES_CACHE_TTL = 120
+SEARCH_CACHE_TTL = 600
 
 messages_cache = {}
 search_cache = {}
-tmdb_cache = {}
-index_cache = {}
-
-TMDB_HEADERS = {
-    "Authorization": f"Bearer {TMDB_BEARER_TOKEN}",
-    "accept": "application/json",
-} if TMDB_BEARER_TOKEN else {}
 
 
 def now_ts():
@@ -56,8 +43,7 @@ def normalize_text(text: str) -> str:
     text = html.unescape(text).lower()
     for ch in ["_", ".", "-", ":", "/", "(", ")", "[", "]"]:
         text = text.replace(ch, " ")
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def cleanup_cache(store):
@@ -99,9 +85,9 @@ def parse_range_header(range_header, size):
     if not m:
         raise HTTPException(status_code=416, detail="Range inválido")
 
-    s, e = m.groups()
-    start = int(s) if s else 0
-    end = int(e) if e else size - 1
+    start_str, end_str = m.groups()
+    start = int(start_str) if start_str else 0
+    end = int(end_str) if end_str else size - 1
 
     if start > end or start >= size:
         raise HTTPException(status_code=416, detail="Range inválido")
@@ -121,7 +107,7 @@ def extract_series_tags(text: str):
         return []
 
     norm = normalize_text(text)
-    tags = []
+    found = []
 
     patterns = [
         r"\bs(\d{1,2})e(\d{1,2})\b",
@@ -132,11 +118,17 @@ def extract_series_tags(text: str):
 
     for pattern in patterns:
         for match in re.finditer(pattern, norm):
-            season = int(match.group(1))
-            episode = int(match.group(2))
-            tags.append((season, episode))
+            found.append((int(match.group(1)), int(match.group(2))))
 
-    return list(dict.fromkeys(tags))
+    # remove duplicados preservando ordem
+    unique = []
+    seen = set()
+    for item in found:
+        if item not in seen:
+            seen.add(item)
+            unique.append(item)
+
+    return unique
 
 
 def extract_complete_seasons(text: str):
@@ -144,7 +136,7 @@ def extract_complete_seasons(text: str):
         return []
 
     norm = normalize_text(text)
-    seasons = []
+    found = []
 
     patterns = [
         r"\bs(\d{1,2})\s+complete\b",
@@ -154,153 +146,32 @@ def extract_complete_seasons(text: str):
 
     for pattern in patterns:
         for match in re.finditer(pattern, norm):
-            seasons.append(int(match.group(1)))
+            found.append(int(match.group(1)))
 
-    return list(dict.fromkeys(seasons))
+    unique = []
+    seen = set()
+    for item in found:
+        if item not in seen:
+            seen.add(item)
+            unique.append(item)
+
+    return unique
 
 
-def token_variants(text: str):
+def basic_score(text: str, query_words, year=""):
     norm = normalize_text(text)
     if not norm:
-        return []
-    return [w for w in norm.split() if len(w) > 2]
-
-
-def has_sequel_marker(text: str) -> bool:
-    norm = normalize_text(text)
-    patterns = [
-        r"\b2\b",
-        r"\bii\b",
-        r"\bpart 2\b",
-        r"\bparte 2\b",
-        r"\bvolume 2\b",
-        r"\bvol 2\b",
-        r"\bchapter 2\b",
-        r"\bcapitulo 2\b",
-        r"\bcapítulo 2\b",
-    ]
-    return any(re.search(p, norm) for p in patterns)
-
-
-def requested_has_sequel_marker(titles):
-    return any(has_sequel_marker(t) for t in titles or [])
-
-
-def score_against_queries(queries, text, year=None, kind="movie"):
-    norm_text = normalize_text(text)
-    if not norm_text:
         return 0
 
     score = 0
+    for word in query_words:
+        if word in norm:
+            score += 10
 
-    for query in queries:
-        qn = normalize_text(query)
-        if not qn:
-            continue
-
-        if qn in norm_text:
-            score += 140
-
-        q_words = token_variants(qn)
-        matched = sum(1 for w in q_words if w in norm_text)
-        score += matched * 14
-
-        if q_words:
-            ratio = matched / len(q_words)
-            if ratio >= 0.8:
-                score += 40
-            elif ratio >= 0.5:
-                score += 20
-
-    if year and str(year) in norm_text:
-        score += 30
-
-    if kind == "movie" and ("#movie" in norm_text or "#filme" in norm_text):
-        score += 10
-
-    if kind == "series" and ("#series" in norm_text or "#serie" in norm_text):
-        score += 10
+    if year and year in norm:
+        score += 20
 
     return score
-
-
-def score_series_episode(season: int, episode: int, text: str):
-    queries = [
-        f"s{season:02d}e{episode:02d}",
-        f"{season}x{episode:02d}",
-        f"{season}x{episode}",
-        f"temporada {season} episodio {episode}",
-        f"temporada {season} episódio {episode}",
-    ]
-    return score_against_queries(queries, text, kind="series")
-
-
-def tmdb_find_by_imdb(imdb_id):
-    if not TMDB_BEARER_TOKEN:
-        print("TMDB_BEARER_TOKEN não configurado")
-        return {}
-
-    cached = get_cached(tmdb_cache, imdb_id)
-    if cached is not None:
-        return cached
-
-    url = f"https://api.themoviedb.org/3/find/{imdb_id}"
-    params = {
-        "external_source": "imdb_id",
-        "language": "pt-BR",
-    }
-
-    try:
-        res = requests.get(url, headers=TMDB_HEADERS, params=params, timeout=15)
-        print("TMDb status:", res.status_code)
-        data = res.json()
-        print(f"TMDb find {imdb_id}: {data}")
-    except Exception as e:
-        print(f"Erro TMDb em {imdb_id}: {e}")
-        data = {}
-
-    set_cached(tmdb_cache, imdb_id, data, TMDB_CACHE_TTL)
-    return data
-
-
-def get_movie_metadata(imdb_id):
-    data = tmdb_find_by_imdb(imdb_id)
-    results = data.get("movie_results") or []
-    if not results:
-        return {"titles": [], "year": ""}
-
-    movie = results[0]
-    titles = []
-
-    for key in ["title", "original_title"]:
-        value = movie.get(key)
-        if value:
-            titles.append(value)
-
-    release_date = movie.get("release_date", "")
-    year = release_date[:4] if release_date else ""
-
-    return {
-        "titles": list(dict.fromkeys(titles)),
-        "year": year
-    }
-
-
-def get_series_metadata(imdb_id):
-    data = tmdb_find_by_imdb(imdb_id)
-    results = data.get("tv_results") or []
-    if not results:
-        return {"titles": []}
-
-    tv = results[0]
-    titles = []
-
-    for key in ["name", "original_name"]:
-        value = tv.get(key)
-        if value:
-            titles.append(value)
-
-    return {"titles": list(dict.fromkeys(titles))}
 
 
 async def fetch_messages():
@@ -319,17 +190,13 @@ async def fetch_messages():
         if getattr(m, "file", None) and getattr(m.file, "name", None):
             file_name = m.file.name or ""
 
-        caption = m.message or ""
-        combined_text = " ".join([caption, file_name]).strip()
+        combined_text = f"{m.message or ''} {file_name}".strip()
         norm = normalize_text(combined_text)
 
         items.append({
             "id": m.id,
-            "text": combined_text,
-            "caption": caption,
-            "file_name": file_name,
+            "text": combined_text[:160],
             "norm": norm,
-            "media": True,
             "year": extract_year(combined_text),
             "series_tags": extract_series_tags(combined_text),
             "complete_seasons": extract_complete_seasons(combined_text),
@@ -339,89 +206,40 @@ async def fetch_messages():
     return items
 
 
-async def build_media_index():
-    cached = get_cached(index_cache, "media_index")
+async def find_movie(movie_id):
+    cache_key = f"movie:{movie_id}"
+    cached = get_cached(search_cache, cache_key)
     if cached is not None:
         return cached
 
+    # versão ultra lite: sem TMDb
+    # só tenta casar pelo imdb no próprio texto, ano e texto simples
     messages = await fetch_messages()
 
-    movie_items = []
-    series_items = []
-    token_map = {}
+    best = None
+    best_score = -1
+
+    # usa o imdb id como pista fraca
+    imdb_words = [movie_id.lower()]
+    year = ""
 
     for item in messages:
-        movie_items.append(item)
+        score = basic_score(item["norm"], imdb_words, year=year)
 
-        if item["series_tags"] or item["complete_seasons"]:
-            series_items.append(item)
+        # bônus leve se tiver o tt no texto
+        if movie_id.lower() in item["norm"]:
+            score += 40
 
-        for token in token_variants(item["norm"]):
-            token_map.setdefault(token, []).append(item)
+        if score > best_score:
+            best_score = score
+            best = item
 
-    index = {
-        "movies": movie_items,
-        "series": series_items,
-        "token_map": token_map,
-    }
+    # fallback: primeira mídia
+    if best_score <= 0 and messages:
+        best = messages[0]
 
-    set_cached(index_cache, "media_index", index, MESSAGES_CACHE_TTL)
-    return index
-
-
-def narrow_candidates_by_titles(index, titles):
-    token_map = index["token_map"]
-    candidate_ids = set()
-    candidates = []
-
-    for title in titles or []:
-        for token in token_variants(title):
-            for item in token_map.get(token, []):
-                if item["id"] not in candidate_ids:
-                    candidate_ids.add(item["id"])
-                    candidates.append(item)
-
-    return candidates
-
-
-def rank_movie_candidates(candidates, titles, year):
-    ranked = []
-    want_sequel = requested_has_sequel_marker(titles)
-
-    for item in candidates:
-        pre_score = score_against_queries(titles, item["text"], year=year, kind="movie")
-
-        if year and item["year"] == year:
-            pre_score += 25
-
-        candidate_has_sequel = has_sequel_marker(item["text"])
-        if want_sequel != candidate_has_sequel:
-            pre_score -= 50
-
-        ranked.append((pre_score, item))
-
-    ranked.sort(key=lambda x: x[0], reverse=True)
-    return [item for _, item in ranked[:MAX_MOVIE_CANDIDATES]]
-
-
-def rank_series_candidates(candidates, titles, season, episode):
-    ranked = []
-
-    for item in candidates:
-        pre_score = 0
-        pre_score += score_series_episode(season, episode, item["text"]) * 3
-        pre_score += score_against_queries(titles, item["text"], kind="series")
-
-        if (season, episode) in item["series_tags"]:
-            pre_score += 100
-
-        if season in item["complete_seasons"]:
-            pre_score += 20
-
-        ranked.append((pre_score, item))
-
-    ranked.sort(key=lambda x: x[0], reverse=True)
-    return [item for _, item in ranked[:MAX_SERIES_CANDIDATES]]
+    set_cached(search_cache, cache_key, best, SEARCH_CACHE_TTL)
+    return best
 
 
 async def find_series(series_id):
@@ -435,93 +253,44 @@ async def find_series(series_id):
         set_cached(search_cache, cache_key, None, SEARCH_CACHE_TTL)
         return None
 
-    meta = get_series_metadata(imdb_id)
-    title_queries = meta.get("titles", [])
-    index = await build_media_index()
-
-    candidates = narrow_candidates_by_titles(index, title_queries)
-    if not candidates:
-        candidates = index["series"]
-
-    candidates = rank_series_candidates(candidates, title_queries, season, episode)
+    messages = await fetch_messages()
 
     best = None
     best_score = -1
 
-    for item in candidates:
+    for item in messages:
         score = 0
-        score += score_series_episode(season, episode, item["text"]) * 3
-        score += score_against_queries(title_queries, item["text"], kind="series")
 
         if (season, episode) in item["series_tags"]:
-            score += 160
+            score += 120
 
         if season in item["complete_seasons"]:
-            score += 25
-
-        if score > best_score:
-            best_score = score
-            best = item
-
-    if best_score < 100:
-        best = None
-
-    set_cached(search_cache, cache_key, best, SEARCH_CACHE_TTL)
-    return best
-
-
-async def find_movie(movie_id):
-    cache_key = f"movie:{movie_id}"
-    cached = get_cached(search_cache, cache_key)
-    if cached is not None:
-        return cached
-
-    meta = get_movie_metadata(movie_id)
-    title_queries = meta.get("titles", [])
-    year = meta.get("year", "")
-    index = await build_media_index()
-
-    candidates = narrow_candidates_by_titles(index, title_queries)
-    if not candidates:
-        candidates = index["movies"]
-
-    candidates = rank_movie_candidates(candidates, title_queries, year)
-
-    best = None
-    best_score = -1
-    want_sequel = requested_has_sequel_marker(title_queries)
-
-    for item in candidates:
-        score = 0
-        score += score_against_queries(title_queries, item["text"], year=year, kind="movie")
-
-        if year and item["year"] == year:
             score += 40
 
-        candidate_has_sequel = has_sequel_marker(item["text"])
-        if want_sequel != candidate_has_sequel:
-            score -= 80
-
-        if not want_sequel and candidate_has_sequel:
-            score -= 50
+        if imdb_id and imdb_id.lower() in item["norm"]:
+            score += 20
 
         if score > best_score:
             best_score = score
             best = item
 
-    if best_score < 50:
-        fallback = None
+    # se não achou bom, tenta por texto simples de episódio
+    if best_score < 40:
+        wanted_tags = [
+            f"s{season:02d}e{episode:02d}",
+            f"{season}x{episode:02d}",
+            f"{season}x{episode}",
+        ]
 
-        if year:
-            for item in candidates:
-                if item["year"] == year:
-                    fallback = item
-                    break
+        for item in messages:
+            score = 0
+            for tag in wanted_tags:
+                if tag in item["norm"]:
+                    score += 60
 
-        if not fallback and not title_queries and candidates:
-            fallback = candidates[0]
-
-        best = fallback
+            if score > best_score:
+                best_score = score
+                best = item
 
     set_cached(search_cache, cache_key, best, SEARCH_CACHE_TTL)
     return best
@@ -549,15 +318,13 @@ app.add_middleware(
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def home():
-    return {"status": "ok", "version": "4.4.0"}
+    return {"status": "ok", "version": "ultra-lite-1.0"}
 
 
 @app.get("/refresh")
 async def refresh():
     messages_cache.clear()
     search_cache.clear()
-    tmdb_cache.clear()
-    index_cache.clear()
     return {"status": "cache limpo"}
 
 
@@ -565,17 +332,15 @@ async def refresh():
 def manifest():
     return {
         "id": "org.telaverde.telegram",
-        "version": "4.4.0",
+        "version": "ultra-lite-1.0",
         "name": "TelaVerde",
-        "description": "Telegram + TMDb + prebuffer",
+        "description": "Modo ultra leve",
         "logo": "https://i.imgur.com/7z9QZ6P.png",
         "resources": ["stream"],
         "types": ["movie", "series"],
         "idPrefixes": ["tt"],
         "catalogs": [],
-        "behaviorHints": {
-            "configurable": False
-        }
+        "behaviorHints": {"configurable": False}
     }
 
 
@@ -592,60 +357,18 @@ async def video(mid: int, range: str | None = Header(None)):
 
     start, end = parse_range_header(range, size)
     length = end - start + 1
-    initial_target = min(length, PREBUFFER_SIZE)
+    limit = (length + CHUNK_SIZE - 1) // CHUNK_SIZE
 
     async def stream_chunks():
         sent = 0
-        prebuffer = bytearray()
 
-        # fase 1: monta pré-buffer
-        pre_limit = (initial_target + CHUNK_SIZE - 1) // CHUNK_SIZE
         async for chunk in client.iter_download(
             msg.media,
             offset=start,
             chunk_size=CHUNK_SIZE,
             request_size=REQUEST_SIZE,
-            limit=pre_limit,
-            file_size=size
-        ):
-            if isinstance(chunk, memoryview):
-                chunk = chunk.tobytes()
-            else:
-                chunk = bytes(chunk)
-
-            remaining_pre = initial_target - len(prebuffer)
-            if remaining_pre <= 0:
-                break
-
-            piece = chunk[:remaining_pre]
-            if not piece:
-                break
-
-            prebuffer.extend(piece)
-
-            if len(prebuffer) >= initial_target:
-                break
-
-        if prebuffer:
-            sent += len(prebuffer)
-            yield bytes(prebuffer)
-
-        # fase 2: continua do ponto onde parou
-        next_offset = start + sent
-        remaining_total = length - sent
-
-        if remaining_total <= 0:
-            return
-
-        remain_limit = (remaining_total + CHUNK_SIZE - 1) // CHUNK_SIZE
-
-        async for chunk in client.iter_download(
-            msg.media,
-            offset=next_offset,
-            chunk_size=CHUNK_SIZE,
-            request_size=REQUEST_SIZE,
-            limit=remain_limit,
-            file_size=size
+            limit=limit,
+            file_size=size,
         ):
             if isinstance(chunk, memoryview):
                 chunk = chunk.tobytes()
@@ -675,9 +398,9 @@ async def video(mid: int, range: str | None = Header(None)):
             "Content-Range": f"bytes {start}-{end}/{size}",
             "Content-Disposition": f'inline; filename="{filename}"',
             "Content-Type": "video/mp4",
-            "Cache-Control": "public, max-age=3600",
+            "Cache-Control": "public, max-age=900",
         },
-        media_type="video/mp4"
+        media_type="video/mp4",
     )
 
 
@@ -703,8 +426,8 @@ async def video_head(mid: int, range: str | None = Header(None)):
             "Content-Range": f"bytes {start}-{end}/{size}",
             "Content-Disposition": f'inline; filename="{filename}"',
             "Content-Type": "video/mp4",
-            "Cache-Control": "public, max-age=3600",
-        }
+            "Cache-Control": "public, max-age=900",
+        },
     )
 
 
@@ -724,7 +447,7 @@ async def stream(type, id):
                 {
                     "name": "TelaVerde",
                     "title": match["text"] or ("Episódio" if type == "series" else "Filme"),
-                    "url": f"{PUBLIC_BASE_URL}/video/{match['id']}"
+                    "url": f"{PUBLIC_BASE_URL}/video/{match['id']}",
                 }
             ]
         }
