@@ -24,7 +24,7 @@ if not all([API_ID, API_HASH, CHANNEL_ID, STRING_SESSION, PUBLIC_BASE_URL]):
 
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
-# BALANCEADO E MAIS CORRETO
+# CONFIG BALANCEADA
 CHUNK_SIZE = 192 * 1024
 REQUEST_SIZE = 192 * 1024
 MESSAGE_LIMIT = 800
@@ -82,10 +82,10 @@ def set_cache(cache, key, val, ttl):
 
 def parse_series_id(series_id):
     try:
-        _, s, e = series_id.split(":")
-        return int(s), int(e)
+        imdb_id, s, e = series_id.split(":")
+        return imdb_id, int(s), int(e)
     except Exception:
-        return None, None
+        return None, None, None
 
 
 def parse_range(range_header, size):
@@ -296,13 +296,16 @@ async def find_series(series_id):
     if cached:
         return cached
 
-    season, episode = parse_series_id(series_id)
+    imdb_id, season, episode = parse_series_id(series_id)
     msgs = await fetch_messages()
 
     best = None
     best_score = -1
 
     if season is not None:
+        meta = omdb_lookup(imdb_id) if imdb_id else {"title": ""}
+        show_title = meta.get("title", "")
+
         tags = [
             f"s{season:02d}e{episode:02d}",
             f"{season}x{episode:02d}",
@@ -312,6 +315,7 @@ async def find_series(series_id):
         for m in msgs:
             score = 0
 
+            # match exato de episódio
             for t in tags:
                 if t in m["norm"]:
                     score += 100
@@ -319,8 +323,19 @@ async def find_series(series_id):
             if (season, episode) in m["series_tags"]:
                 score += 140
 
+            # nome da série vindo do OMDb
+            if show_title:
+                show_norm = normalize(show_title)
+                if show_norm in m["norm"]:
+                    score += 60
+                else:
+                    words = token_words(show_title)
+                    matched = sum(1 for w in words if w in m["norm"])
+                    score += matched * 10
+
+            # penaliza pack de temporada completa para não roubar episódio
             if season in m["complete_seasons"]:
-                score += 30
+                score -= 20
 
             if len(m["title"]) > 5:
                 score += 3
@@ -339,7 +354,6 @@ async def find_series(series_id):
 def build_display_title(item, type_, stremio_id):
     if item.get("title"):
         return item["title"]
-
     return "Episódio" if type_ == "series" else stremio_id
 
 
@@ -370,9 +384,9 @@ def home():
 def manifest():
     return {
         "id": "org.telaverde.telegram",
-        "version": "1.1.0",
+        "version": "1.1.1",
         "name": "TelaVerde",
-        "description": "Balanced Mode + OMDb",
+        "description": "Balanced Mode + OMDb fix séries",
         "resources": ["stream"],
         "types": ["movie", "series"],
         "idPrefixes": ["tt"],
