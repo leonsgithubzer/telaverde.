@@ -179,20 +179,22 @@ def omdb_lookup(imdb_id: str):
         r = requests.get(
             "https://www.omdbapi.com/",
             params={"i": imdb_id, "apikey": OMDB_API_KEY},
-            timeout=8,
+            timeout=5,
         )
         data = r.json()
-    except Exception:
-        data = {}
 
-    title = data.get("Title", "") if data.get("Response") == "True" else ""
-    year = data.get("Year", "") if data.get("Response") == "True" else ""
-    if year and len(year) >= 4:
-        year = year[:4]
+        if data.get("Response") == "True":
+            result = {
+                "title": data.get("Title", ""),
+                "year": (data.get("Year", "")[:4] if data.get("Year") else "")
+            }
+            set_cache(omdb_cache, imdb_id, result, OMDB_CACHE_TTL)
+            return result
 
-    result = {"title": title, "year": year}
-    set_cache(omdb_cache, imdb_id, result, OMDB_CACHE_TTL)
-    return result
+    except Exception as e:
+        print("OMDB ERRO:", e)
+
+    return {"title": "", "year": ""}
 
 
 def score_text_against_title(text: str, title: str, year: str = ""):
@@ -315,7 +317,6 @@ async def find_series(series_id):
         for m in msgs:
             score = 0
 
-            # match exato de episódio
             for t in tags:
                 if t in m["norm"]:
                     score += 100
@@ -323,7 +324,6 @@ async def find_series(series_id):
             if (season, episode) in m["series_tags"]:
                 score += 140
 
-            # nome da série vindo do OMDb
             if show_title:
                 show_norm = normalize(show_title)
                 if show_norm in m["norm"]:
@@ -333,7 +333,6 @@ async def find_series(series_id):
                     matched = sum(1 for w in words if w in m["norm"])
                     score += matched * 10
 
-            # penaliza pack de temporada completa para não roubar episódio
             if season in m["complete_seasons"]:
                 score -= 20
 
@@ -384,9 +383,9 @@ def home():
 def manifest():
     return {
         "id": "org.telaverde.telegram",
-        "version": "1.1.1",
+        "version": "1.1.2",
         "name": "TelaVerde",
-        "description": "Balanced Mode + OMDb fix séries",
+        "description": "Balanced Mode + OMDb safe fix",
         "resources": ["stream"],
         "types": ["movie", "series"],
         "idPrefixes": ["tt"],
@@ -475,7 +474,12 @@ async def video_head(mid: int, range: str | None = Header(None)):
 @app.get("/stream/{type}/{id}.json")
 async def stream(type, id):
     try:
-        item = await (find_series(id) if type == "series" else find_movie(id))
+        try:
+            item = await (find_series(id) if type == "series" else find_movie(id))
+        except Exception as e:
+            print("ERRO FIND:", e)
+            traceback.print_exc()
+            return {"streams": []}
 
         if not item:
             return {"streams": []}
@@ -491,6 +495,6 @@ async def stream(type, id):
         }
 
     except Exception as e:
-        print(e)
+        print("ERRO STREAM:", e)
         traceback.print_exc()
         return {"streams": []}
