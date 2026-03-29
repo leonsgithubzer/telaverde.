@@ -24,7 +24,6 @@ if not all([API_ID, API_HASH, CHANNEL_ID, STRING_SESSION, PUBLIC_BASE_URL]):
 
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
-# CONFIG BALANCEADA
 CHUNK_SIZE = 192 * 1024
 REQUEST_SIZE = 192 * 1024
 MESSAGE_LIMIT = 800
@@ -253,18 +252,25 @@ async def fetch_messages():
         if not (m.video or m.document):
             continue
 
-        name = m.file.name if getattr(m.file, "name", None) else ""
-        text = f"{m.message or ''} {name}".strip()
+        caption = (m.message or "").strip()
+        file_name = m.file.name if getattr(m.file, "name", None) else ""
+
+        # usa legenda e nome do arquivo juntos
+        raw_text = f"{caption} {file_name}".strip()
+
+        # título exibido: prioriza legenda
+        display_title = clean_title(caption) if caption else clean_title(file_name or raw_text)
 
         data.append({
             "id": m.id,
-            "norm": normalize(text),
-            "title": clean_title(name or text),
-            "file_name": name,
-            "year": extract_year(text),
-            "series_tags": extract_series_tags(text),
-            "complete_seasons": extract_complete_seasons(text),
-            "is_series_like": extract_is_series_like(text),
+            "caption": caption,
+            "norm": normalize(raw_text),
+            "title": display_title,
+            "file_name": file_name,
+            "year": extract_year(raw_text),
+            "series_tags": extract_series_tags(raw_text),
+            "complete_seasons": extract_complete_seasons(raw_text),
+            "is_series_like": extract_is_series_like(raw_text),
         })
 
     set_cache(messages_cache, "all", data, MESSAGES_CACHE_TTL)
@@ -343,22 +349,23 @@ async def find_series(series_id):
 
             for t in tags:
                 if t in m["norm"]:
-                    score += 100
+                    score += 120
 
             if (season, episode) in m["series_tags"]:
-                score += 140
+                score += 160
 
             if show_title:
                 show_norm = normalize(show_title)
                 if show_norm in m["norm"]:
-                    score += 60
+                    score += 70
                 else:
                     words = token_words(show_title)
                     matched = sum(1 for w in words if w in m["norm"])
-                    score += matched * 10
+                    score += matched * 12
 
+            # pack de temporada completa só como fallback
             if season in m["complete_seasons"]:
-                score -= 20
+                score += 10
 
             if len(m["title"]) > 5:
                 score += 3
@@ -367,8 +374,8 @@ async def find_series(series_id):
                 best_score = score
                 best = m
 
-    if not best and msgs:
-        best = msgs[0]
+    if best_score < 70:
+        best = None
 
     set_cache(search_cache, series_id, best, SEARCH_CACHE_TTL)
     return best
@@ -408,9 +415,9 @@ def home():
 def manifest():
     return {
         "id": "org.telaverde.telegram",
-        "version": "1.1.3",
+        "version": "1.1.4",
         "name": "TelaVerde",
-        "description": "Balanced Mode + OMDb safe fixes",
+        "description": "Balanced Mode + caption-aware fixes",
         "resources": ["stream"],
         "types": ["movie", "series"],
         "idPrefixes": ["tt"],
