@@ -24,8 +24,8 @@ if not all([API_ID, API_HASH, CHANNEL_ID, STRING_SESSION, PUBLIC_BASE_URL]):
 
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
-CHUNK_SIZE = 192 * 1024
-REQUEST_SIZE = 192 * 1024
+CHUNK_SIZE = 128 * 1024
+REQUEST_SIZE = 128 * 1024
 MESSAGE_LIMIT = 800
 MESSAGES_CACHE_TTL = 180
 SEARCH_CACHE_TTL = 900
@@ -240,6 +240,30 @@ def score_text_against_title(text: str, title: str, year: str = ""):
     return score
 
 
+def guess_media_type(filename: str) -> str:
+    if not filename:
+        return "application/octet-stream"
+
+    name = filename.lower()
+
+    if name.endswith(".mp4") or name.endswith(".m4v"):
+        return "video/mp4"
+    if name.endswith(".mkv"):
+        return "video/x-matroska"
+    if name.endswith(".webm"):
+        return "video/webm"
+    if name.endswith(".avi"):
+        return "video/x-msvideo"
+    if name.endswith(".mov"):
+        return "video/quicktime"
+    if name.endswith(".wmv"):
+        return "video/x-ms-wmv"
+    if name.endswith(".flv"):
+        return "video/x-flv"
+
+    return "application/octet-stream"
+
+
 async def fetch_messages():
     cached = get_cache(messages_cache, "all")
     if cached:
@@ -254,11 +278,8 @@ async def fetch_messages():
 
         caption = (m.message or "").strip()
         file_name = m.file.name if getattr(m.file, "name", None) else ""
-
-        # usa legenda e nome do arquivo juntos
         raw_text = f"{caption} {file_name}".strip()
 
-        # título exibido: prioriza legenda
         display_title = clean_title(caption) if caption else clean_title(file_name or raw_text)
 
         data.append({
@@ -363,9 +384,11 @@ async def find_series(series_id):
                     matched = sum(1 for w in words if w in m["norm"])
                     score += matched * 12
 
-            # pack de temporada completa só como fallback
             if season in m["complete_seasons"]:
                 score += 10
+
+            if not m.get("is_series_like") and not m.get("series_tags"):
+                score -= 20
 
             if len(m["title"]) > 5:
                 score += 3
@@ -374,7 +397,7 @@ async def find_series(series_id):
                 best_score = score
                 best = m
 
-    if best_score < 70:
+    if best_score < 90:
         best = None
 
     set_cache(search_cache, series_id, best, SEARCH_CACHE_TTL)
@@ -415,9 +438,9 @@ def home():
 def manifest():
     return {
         "id": "org.telaverde.telegram",
-        "version": "1.1.4",
+        "version": "1.1.5",
         "name": "TelaVerde",
-        "description": "Balanced Mode + caption-aware fixes",
+        "description": "Balanced Mode + media type fix",
         "resources": ["stream"],
         "types": ["movie", "series"],
         "idPrefixes": ["tt"],
@@ -442,12 +465,15 @@ async def video(mid: int, range: str | None = Header(None)):
         raise HTTPException(status_code=404, detail="Mídia não encontrada")
 
     size = int(msg.file.size)
+    filename = msg.file.name if getattr(msg.file, "name", None) else f"video_{msg.id}"
+    media_type = guess_media_type(filename)
+
     start, end = parse_range(range, size)
     length = end - start + 1
+    limit = (length + CHUNK_SIZE - 1) // CHUNK_SIZE
 
     async def stream():
         sent = 0
-        limit = (length + CHUNK_SIZE - 1) // CHUNK_SIZE
 
         async for chunk in client.iter_download(
             msg.media,
@@ -475,8 +501,11 @@ async def video(mid: int, range: str | None = Header(None)):
             "Content-Range": f"bytes {start}-{end}/{size}",
             "Content-Length": str(length),
             "Accept-Ranges": "bytes",
-            "Content-Type": "video/mp4"
-        }
+            "Content-Type": media_type,
+            "Content-Disposition": f'inline; filename="{filename}"',
+            "Cache-Control": "public, max-age=900",
+        },
+        media_type=media_type,
     )
 
 
@@ -489,6 +518,9 @@ async def video_head(mid: int, range: str | None = Header(None)):
         raise HTTPException(status_code=404, detail="Mídia não encontrada")
 
     size = int(msg.file.size)
+    filename = msg.file.name if getattr(msg.file, "name", None) else f"video_{msg.id}"
+    media_type = guess_media_type(filename)
+
     start, end = parse_range(range, size)
     length = end - start + 1
 
@@ -498,7 +530,9 @@ async def video_head(mid: int, range: str | None = Header(None)):
             "Accept-Ranges": "bytes",
             "Content-Length": str(length),
             "Content-Range": f"bytes {start}-{end}/{size}",
-            "Content-Type": "video/mp4",
+            "Content-Type": media_type,
+            "Content-Disposition": f'inline; filename="{filename}"',
+            "Cache-Control": "public, max-age=900",
         },
     )
 
