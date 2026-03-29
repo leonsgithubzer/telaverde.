@@ -56,7 +56,10 @@ def clean_title(text: str) -> str:
     text = os.path.basename(text)
     text = re.sub(r"\.(mkv|mp4|avi|mov|wmv|flv|webm|m4v)$", "", text, flags=re.I)
     text = text.replace(".", " ").replace("_", " ").replace("-", " ")
-    return re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > 140:
+        text = text[:140].strip()
+    return text
 
 
 def token_words(text: str):
@@ -167,6 +170,19 @@ def extract_complete_seasons(text: str):
     return unique
 
 
+def extract_is_series_like(text: str) -> bool:
+    norm = normalize(text)
+    patterns = [
+        r"\bs\d{1,2}e\d{1,2}\b",
+        r"\b\d{1,2}x\d{1,2}\b",
+        r"\btemporada\s+\d{1,2}\b",
+        r"\bepisodio\s+\d{1,2}\b",
+        r"\bepisódio\s+\d{1,2}\b",
+        r"\bseason\s+\d{1,2}\b",
+    ]
+    return any(re.search(p, norm) for p in patterns)
+
+
 def omdb_lookup(imdb_id: str):
     if not OMDB_API_KEY:
         return {"title": "", "year": ""}
@@ -248,6 +264,7 @@ async def fetch_messages():
             "year": extract_year(text),
             "series_tags": extract_series_tags(text),
             "complete_seasons": extract_complete_seasons(text),
+            "is_series_like": extract_is_series_like(text),
         })
 
     set_cache(messages_cache, "all", data, MESSAGES_CACHE_TTL)
@@ -264,6 +281,8 @@ async def find_movie(movie_id):
     wanted_title = meta.get("title", "")
     wanted_year = meta.get("year", "")
 
+    print("MOVIE OMDB:", movie_id, wanted_title, wanted_year)
+
     best = None
     best_score = -1
 
@@ -271,13 +290,16 @@ async def find_movie(movie_id):
         score = 0
 
         if movie_id.lower() in m["norm"]:
-            score += 120
+            score += 180
 
         score += score_text_against_title(m["title"], wanted_title, wanted_year)
         score += score_text_against_title(m["norm"], wanted_title, wanted_year)
 
         if wanted_year and m["year"] == wanted_year:
-            score += 20
+            score += 35
+
+        if m.get("is_series_like"):
+            score -= 150
 
         if len(m["title"]) > 5:
             score += 3
@@ -286,8 +308,10 @@ async def find_movie(movie_id):
             best_score = score
             best = m
 
-    if not best and msgs:
-        best = msgs[0]
+    print("MOVIE BEST:", movie_id, "score=", best_score, "title=", best["title"] if best else None)
+
+    if best_score < 80:
+        best = None
 
     set_cache(search_cache, movie_id, best, SEARCH_CACHE_TTL)
     return best
@@ -359,6 +383,7 @@ def build_display_title(item, type_, stremio_id):
 @asynccontextmanager
 async def lifespan(app):
     await client.start()
+    print("Telegram conectado")
     yield
     await client.disconnect()
 
@@ -383,9 +408,9 @@ def home():
 def manifest():
     return {
         "id": "org.telaverde.telegram",
-        "version": "1.1.2",
+        "version": "1.1.3",
         "name": "TelaVerde",
-        "description": "Balanced Mode + OMDb safe fix",
+        "description": "Balanced Mode + OMDb safe fixes",
         "resources": ["stream"],
         "types": ["movie", "series"],
         "idPrefixes": ["tt"],
