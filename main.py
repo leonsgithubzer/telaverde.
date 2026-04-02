@@ -24,8 +24,10 @@ if not all([API_ID, API_HASH, CHANNEL_ID, STRING_SESSION, PUBLIC_BASE_URL]):
 
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
+# Estável e leve para Render
 CHUNK_SIZE = 64 * 1024
 REQUEST_SIZE = 64 * 1024
+
 MESSAGE_LIMIT = 800
 MESSAGES_CACHE_TTL = 180
 SEARCH_CACHE_TTL = 900
@@ -44,7 +46,7 @@ def normalize(text: str) -> str:
     if not text:
         return ""
     text = html.unescape(text).lower()
-    for ch in ["_", ".", "-", ":", "/", "(", ")", "[", "]", "{", "}", "|"]:
+    for ch in ["_", ".", "-", ":", "/", "(", ")", "[", "]", "{", "}", "|", "•", "–", "—"]:
         text = text.replace(ch, " ")
     return re.sub(r"\s+", " ", text).strip()
 
@@ -74,8 +76,8 @@ def get_cache(cache: dict, key: str):
     return item["data"]
 
 
-def set_cache(cache: dict, key: str, val, ttl: int) -> None:
-    cache[key] = {"data": val, "exp": now() + ttl}
+def set_cache(cache: dict, key: str, value, ttl: int) -> None:
+    cache[key] = {"data": value, "exp": now() + ttl}
 
 
 def parse_series_id(series_id: str):
@@ -182,20 +184,20 @@ def guess_media_type(filename: str) -> str:
     if not filename:
         return "application/octet-stream"
 
-    name = filename.lower()
-    if name.endswith(".mp4") or name.endswith(".m4v"):
+    f = filename.lower()
+    if f.endswith(".mp4") or f.endswith(".m4v"):
         return "video/mp4"
-    if name.endswith(".mkv"):
+    if f.endswith(".mkv"):
         return "video/x-matroska"
-    if name.endswith(".webm"):
+    if f.endswith(".webm"):
         return "video/webm"
-    if name.endswith(".avi"):
+    if f.endswith(".avi"):
         return "video/x-msvideo"
-    if name.endswith(".mov"):
+    if f.endswith(".mov"):
         return "video/quicktime"
-    if name.endswith(".wmv"):
+    if f.endswith(".wmv"):
         return "video/x-ms-wmv"
-    if name.endswith(".flv"):
+    if f.endswith(".flv"):
         return "video/x-flv"
     return "application/octet-stream"
 
@@ -215,6 +217,7 @@ def omdb_lookup(imdb_id: str):
             timeout=5,
         )
         data = r.json()
+
         if data.get("Response") == "True":
             result = {
                 "title": data.get("Title", ""),
@@ -296,10 +299,15 @@ async def fetch_messages():
         if not (m.video or m.document):
             continue
 
+        # MUITO IMPORTANTE:
+        # Essas mídias são encaminhadas de um bot.
+        # Então a legenda/caption é a principal fonte.
         caption = (m.message or "").strip()
         file_name = m.file.name if getattr(m.file, "name", None) else ""
+
         raw = f"{caption} {file_name}".strip()
 
+        # título exibido: prioriza legenda do encaminhamento
         display_title = clean_title(caption) if caption else clean_title(file_name or raw)
 
         data.append({
@@ -389,9 +397,13 @@ async def find_series(series_id: str):
     for m in msgs:
         score = 0
 
-        name_score = title_word_score(m["raw"], show_title) + title_word_score(m["title"], show_title)
+        # 1) Nome da série precisa bater forte
+        name_score = title_word_score(m["caption"], show_title)
+        name_score += title_word_score(m["raw"], show_title)
+        name_score += title_word_score(m["title"], show_title)
         score += name_score
 
+        # 2) Episódio exato precisa bater forte
         tag_hits = 0
         for tag in exact_tags:
             if tag in m["norm"]:
@@ -402,15 +414,21 @@ async def find_series(series_id: str):
             score += 220
             tag_hits += 2
 
+        # 3) Pack de temporada só como fallback
         if season in m["complete_seasons"]:
             score += 20
 
+        # 4) Se parece série, bônus pequeno
         if m["is_series"]:
             score += 10
 
+        # 5) Regra crítica:
+        # se achou episódio mas o nome da série quase não bate,
+        # rejeita forte para não abrir Sherlock em Pokémon/TWD.
         if tag_hits > 0 and name_score < 40:
-            score -= 180
+            score -= 220
 
+        # 6) Arquivo muito genérico perde pontos
         if len(m["title"]) < 4:
             score -= 20
 
@@ -421,7 +439,7 @@ async def find_series(series_id: str):
     print("SERIES OMDB:", imdb_id, show_title, season, episode)
     print("SERIES BEST:", best_score, best["title"] if best else None)
 
-    if best_score < 120:
+    if best_score < 140:
         best = None
 
     set_cache(search_cache, series_id, best, SEARCH_CACHE_TTL)
@@ -455,16 +473,16 @@ app.add_middleware(
 
 @app.get("/")
 def home():
-    return {"status": "ok", "version": "1.1.6"}
+    return {"status": "ok", "version": "1.2.0"}
 
 
 @app.get("/manifest.json")
 def manifest():
     return {
         "id": "org.telaverde.telegram",
-        "version": "1.1.6",
+        "version": "1.2.0",
         "name": "TelaVerde",
-        "description": "Balanced Mode + strict series matching",
+        "description": "Stable mode + forwarded-caption aware series fix",
         "resources": ["stream"],
         "types": ["movie", "series"],
         "idPrefixes": ["tt"],
