@@ -2,7 +2,178 @@ import os
 import re
 import time
 import html
-import traceback
+import os
+import re
+import time
+import html
+import asyncio
+from contextlib import asynccontextmanager
+from urllib.parse import quote
+
+import aiosqlite
+import requests
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
+
+# --- CONFIGURAÇÕES (Variáveis de Ambiente) ---
+API_ID = int(os.getenv("API_ID", 0))
+API_HASH = os.getenv("API_HASH", "")
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", 0))
+STRING_SESSION = os.getenv("STRING_SESSION", "")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", 0))
+FIMOO_API_URL = "https://fenixflix-search.vercel.app/search"
+
+DB_PATH = "registry.db"
+CHUNK_SIZE = 128 * 1024  # 128KB para fluidez
+
+client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
+
+# --- BANCO DE DADOS ---
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            content_type TEXT NOT NULL,
+            imdb_id TEXT NOT NULL,
+            season INTEGER,
+            episode INTEGER,
+            telegram_message_id INTEGER NOT NULL,
+            title TEXT
+        )""")
+        await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_movie ON entries(content_type, imdb_id) WHERE season IS NULL")
+        await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_series ON entries(content_type, imdb_id, season, episode) WHERE season IS NOT NULL")
+        await db.commit()
+
+# --- FUNÇÕES DE BUSCA ---
+async def search_local_db(imdb_id, season=None, episode=None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        if season is None:
+            cur = await db.execute("SELECT telegram_message_id, title FROM entries WHERE imdb_id=? AND season IS NULL", (imdb_id,))
+        else:
+            cur = await db.execute("SELECT telegram_message_id, title FROM entries WHERE imdb_id=? AND season=? AND episode=?", (imdb_id, season, episode))
+        row = await cur.fetchone()
+        return {"id": row[0], "title": row[1]} if row else None
+
+async def search_fimoo(imdb_id, season=None, episode=None):
+    query = f"{imdb_id}:{season}:{episode}" if season else imdb_id
+    try:
+        r = requests.get(f"{FIMOO_API_URL}/{query}", timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            return {"id": data["message_id"], "title": data.get("title", "Fimoo Result")}
+    except: pass
+    return None
+
+# --- COMANDOS TELEGRAM ---
+@client.on(events.NewMessage(pattern=r"^/addmovie\s+(tt\d+)$"))
+async def add_movie(event):
+    if event.sender_id != ADMIN_USER_ID or not event.is_reply: return
+    imdb_id = event.pattern_match.group(1)
+    replied = await event.get_reply_message()
+    title = (replied.message or getattr(replied.file, "name", "Filme")).strip()[:100]
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR REPLACE INTO entries (content_type, imdb_id, telegram_message_id, title) VALUES ('movie', ?, ?, ?)", (imdb_id, replied.id, title))
+        await db.commit()
+    await event.reply(f"✅ Cadastrado: {title}")
+
+@client.on(events.NewMessage(pattern=r"^/addseries\s+(tt\d+)\s+S(\d+)E(\d+)$"))
+async def add_series(event):
+    if event.sender_id != ADMIN_USER_ID or not event.is_reply: return
+    imdb_id, s, e = event.pattern_match.groups()
+    replied = await event.get_reply_message()
+    title = (replied.message or getattr(replied.file, "name", "Episódio")).strip()[:100]
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR REPLACE INTO entries (content_type, imdb_id, season, episode, telegram_message_id, title) VALUES ('series', ?, ?, ?, ?, ?)", (imdb_id, int(s), int(e), replied.id, title))
+        await db.commit()
+    await event.reply(f"✅ Cadastrado: S{s}E{e}")
+
+# --- PROXY DE VÍDEO ---
+async def telegram_stream_generator(msg, start, limit):
+    async for chunk in client.iter_download(msg.media, offset=start, request_size=CHUNK_SIZE, limit=limit):
+        yield chunk
+
+# --- APP ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    await client.start()
+    yield
+    await client.disconnect()
+
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"])
+
+@app.get("/manifest.json")
+def manifest():
+    return {
+        "id": "org.telaverde.hybrid",
+        "version": "2.6.0",
+        "name": "TelaVerde Hybrid",
+        "resources": ["stream"],
+        "types": ["movie", "series"],
+        "idPrefixes": ["tt"]
+    }
+
+@app.get("/stream/{mtype}/{stremio_id}.json")
+async def stream_handler(mtype: str, stremio_id: str):
+    parts = stremio_id.split(":")
+    imdb_id = parts[0]
+    season = int(parts[1]) if len(parts) > 1 else None
+    episode = int(parts[2]) if len(parts) > 2 else None
+
+    # 1. Tenta o seu banco local
+    res = await search_local_db(imdb_id, season, episode)
+    name = "🟢 TelaVerde Local"
+    
+    # 2. Se não achou, tenta o Fimoo
+    if not res:
+        res = await search_fimoo(imdb_id, season, episode)
+        name = "🔥 Fimoo Search"
+
+    if res:
+        return {
+            "streams": [{
+                "name": name,
+                "title": f"{res['title']}\nTelegram Direct",
+                "url": f"{PUBLIC_BASE_URL}/video/{res['id']}"
+            }]
+        }
+    return {"streams": []}
+
+@app.get("/video/{mid}")
+async def video_proxy(mid: int, range: str = Header(None)):
+    try:
+        msg = await client.get_messages(CHANNEL_ID, ids=mid)
+        if not msg or not msg.media: raise HTTPException(status_code=404)
+        
+        file_size = msg.file.size
+        start, end = 0, file_size - 1
+
+        if range:
+            match = re.search(r"bytes=(\d+)-(\d*)", range)
+            if match:
+                start = int(match.group(1))
+                if match.group(2): end = int(match.group(2))
+        
+        content_length = end - start + 1
+        headers = {
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(content_length),
+            "Content-Type": msg.file.mime_type or "video/mp4",
+        }
+        return StreamingResponse(telegram_stream_generator(msg, start, content_length), status_code=206, headers=headers)
+    except:
+        raise HTTPException(status_code=500)
+
+@app.get("/")
+def home(): return {"status": "online"}
+ traceback
 from contextlib import asynccontextmanager
 from urllib.parse import quote
 
