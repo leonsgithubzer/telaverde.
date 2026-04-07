@@ -4,42 +4,53 @@ import time
 import html
 import traceback
 from contextlib import asynccontextmanager
+from urllib.parse import quote
 
+import aiosqlite
 import requests
 from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from telethon import TelegramClient
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 STRING_SESSION = os.getenv("STRING_SESSION")
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 OMDB_API_KEY = os.getenv("OMDB_API_KEY", "").strip()
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID"))
 
-if not all([API_ID, API_HASH, CHANNEL_ID, STRING_SESSION, PUBLIC_BASE_URL]):
+DB_PATH = "registry.db"
+CHUNK_SIZE = 64 * 1024
+REQUEST_SIZE = 64 * 1024
+MESSAGE_LIMIT = 800
+
+if not all([API_ID, API_HASH, CHANNEL_ID, STRING_SESSION, PUBLIC_BASE_URL, ADMIN_USER_ID]):
     raise RuntimeError("Faltam variáveis de ambiente obrigatórias.")
 
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
-# Estável e leve para Render
-CHUNK_SIZE = 64 * 1024
-REQUEST_SIZE = 64 * 1024
-
-MESSAGE_LIMIT = 800
-MESSAGES_CACHE_TTL = 180
-SEARCH_CACHE_TTL = 900
-OMDB_CACHE_TTL = 21600
-
 messages_cache = {}
 search_cache = {}
 omdb_cache = {}
+archive_cache = {}
 
 
 def now() -> float:
     return time.time()
+
+
+def get_cache(cache: dict, key: str):
+    item = cache.get(key)
+    if item and item["exp"] > now():
+        return item["data"]
+    return None
+
+
+def set_cache(cache: dict, key: str, value, ttl: int = 900) -> None:
+    cache[key] = {"data": value, "exp": now() + ttl}
 
 
 def normalize(text: str) -> str:
@@ -62,22 +73,7 @@ def clean_title(text: str) -> str:
 
 
 def token_words(text: str) -> list[str]:
-    norm = normalize(text)
-    return [w for w in norm.split() if len(w) > 2]
-
-
-def get_cache(cache: dict, key: str):
-    item = cache.get(key)
-    if not item:
-        return None
-    if item["exp"] <= now():
-        del cache[key]
-        return None
-    return item["data"]
-
-
-def set_cache(cache: dict, key: str, value, ttl: int) -> None:
-    cache[key] = {"data": value, "exp": now() + ttl}
+    return [w for w in normalize(text).split() if len(w) > 2]
 
 
 def parse_series_id(series_id: str):
@@ -129,33 +125,6 @@ def extract_series_tags(text: str):
     for pattern in patterns:
         for match in re.finditer(pattern, norm):
             found.append((int(match.group(1)), int(match.group(2))))
-
-    unique = []
-    seen = set()
-    for item in found:
-        if item not in seen:
-            seen.add(item)
-            unique.append(item)
-
-    return unique
-
-
-def extract_complete_seasons(text: str):
-    if not text:
-        return []
-
-    norm = normalize(text)
-    found = []
-
-    patterns = [
-        r"\bs(\d{1,2})\s+complete\b",
-        r"\bseason\s+(\d{1,2})\s+complete\b",
-        r"\btemporada\s+(\d{1,2})\s+completa\b",
-    ]
-
-    for pattern in patterns:
-        for match in re.finditer(pattern, norm):
-            found.append(int(match.group(1)))
 
     unique = []
     seen = set()
@@ -223,7 +192,7 @@ def omdb_lookup(imdb_id: str):
                 "title": data.get("Title", ""),
                 "year": (data.get("Year", "")[:4] if data.get("Year") else ""),
             }
-            set_cache(omdb_cache, imdb_id, result, OMDB_CACHE_TTL)
+            set_cache(omdb_cache, imdb_id, result, 21600)
             return result
     except Exception as e:
         print("OMDB ERRO:", e)
@@ -231,45 +200,16 @@ def omdb_lookup(imdb_id: str):
     return {"title": "", "year": ""}
 
 
-def score_text_against_title(text: str, title: str, year: str = "") -> int:
-    norm = normalize(text)
-    if not norm:
-        return 0
-
-    score = 0
-    title_norm = normalize(title)
-
-    if title_norm and title_norm in norm:
-        score += 120
-
-    words = token_words(title)
-    matched = sum(1 for w in words if w in norm)
-    score += matched * 15
-
-    if words:
-        ratio = matched / len(words)
-        if ratio >= 0.8:
-            score += 35
-        elif ratio >= 0.5:
-            score += 18
-
-    if year and year in norm:
-        score += 30
-
-    return score
-
-
 def title_word_score(text: str, title: str) -> int:
     norm = normalize(text)
     words = token_words(title)
-
     if not words:
         return 0
 
     score = 0
     matched = 0
-
     full_title = normalize(title)
+
     if full_title and full_title in norm:
         score += 120
 
@@ -287,6 +227,209 @@ def title_word_score(text: str, title: str) -> int:
     return score
 
 
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            content_type TEXT NOT NULL,
+            imdb_id TEXT NOT NULL,
+            season INTEGER,
+            episode INTEGER,
+            telegram_message_id INTEGER NOT NULL,
+            title TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+        await db.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_movie_unique
+        ON entries(content_type, imdb_id)
+        WHERE season IS NULL AND episode IS NULL
+        """)
+        await db.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_series_unique
+        ON entries(content_type, imdb_id, season, episode)
+        WHERE season IS NOT NULL AND episode IS NOT NULL
+        """)
+        await db.commit()
+
+
+async def upsert_movie(imdb_id: str, telegram_message_id: int, title: str | None = None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        INSERT INTO entries (content_type, imdb_id, season, episode, telegram_message_id, title)
+        VALUES ('movie', ?, NULL, NULL, ?, ?)
+        ON CONFLICT(content_type, imdb_id)
+        DO UPDATE SET telegram_message_id=excluded.telegram_message_id, title=excluded.title
+        """, (imdb_id, telegram_message_id, title))
+        await db.commit()
+
+
+async def upsert_series(imdb_id: str, season: int, episode: int, telegram_message_id: int, title: str | None = None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        INSERT INTO entries (content_type, imdb_id, season, episode, telegram_message_id, title)
+        VALUES ('series', ?, ?, ?, ?, ?)
+        ON CONFLICT(content_type, imdb_id, season, episode)
+        DO UPDATE SET telegram_message_id=excluded.telegram_message_id, title=excluded.title
+        """, (imdb_id, season, episode, telegram_message_id, title))
+        await db.commit()
+
+
+async def get_registered_movie(imdb_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+        SELECT telegram_message_id, title
+        FROM entries
+        WHERE content_type='movie' AND imdb_id=? AND season IS NULL AND episode IS NULL
+        LIMIT 1
+        """, (imdb_id,))
+        return await cur.fetchone()
+
+
+async def get_registered_series(imdb_id: str, season: int, episode: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+        SELECT telegram_message_id, title
+        FROM entries
+        WHERE content_type='series' AND imdb_id=? AND season=? AND episode=?
+        LIMIT 1
+        """, (imdb_id, season, episode))
+        return await cur.fetchone()
+
+
+@client.on(events.NewMessage(pattern=r"^/addmovie\s+(tt\d+)$"))
+async def add_movie_handler(event):
+    if event.sender_id != ADMIN_USER_ID:
+        return
+
+    if not event.is_reply:
+        await event.reply("Responda à mídia encaminhada com /addmovie tt1234567")
+        return
+
+    imdb_id = event.pattern_match.group(1)
+    replied = await event.get_reply_message()
+
+    if not replied or not replied.media or not getattr(replied, "file", None):
+        await event.reply("A mensagem respondida precisa ser uma mídia real do Telegram.")
+        return
+
+    caption = (replied.message or "").strip()
+    title = clean_title(caption) if caption else clean_title(getattr(replied.file, "name", "") or "")
+    await upsert_movie(imdb_id, replied.id, title or None)
+    await event.reply(f"Filme cadastrado: {imdb_id} -> msg {replied.id}")
+
+
+@client.on(events.NewMessage(pattern=r"^/addseries\s+(tt\d+)\s+(S\d{2}E\d{2})$"))
+async def add_series_handler(event):
+    if event.sender_id != ADMIN_USER_ID:
+        return
+
+    if not event.is_reply:
+        await event.reply("Responda à mídia encaminhada com /addseries tt1234567 S01E01")
+        return
+
+    imdb_id = event.pattern_match.group(1)
+    ep_tag = event.pattern_match.group(2)
+    m = re.match(r"S(\d{2})E(\d{2})", ep_tag, re.I)
+    season = int(m.group(1))
+    episode = int(m.group(2))
+
+    replied = await event.get_reply_message()
+
+    if not replied or not replied.media or not getattr(replied, "file", None):
+        await event.reply("A mensagem respondida precisa ser uma mídia real do Telegram.")
+        return
+
+    caption = (replied.message or "").strip()
+    title = clean_title(caption) if caption else clean_title(getattr(replied.file, "name", "") or "")
+    await upsert_series(imdb_id, season, episode, replied.id, title or None)
+    await event.reply(f"Série cadastrada: {imdb_id} S{season:02d}E{episode:02d} -> msg {replied.id}")
+
+
+def archive_candidates_for_movie(imdb_id: str):
+    return [
+        f"fenix-{imdb_id}-nacional",
+        f"fenix-{imdb_id}-dual",
+        f"fenix-{imdb_id}",
+    ]
+
+
+def archive_candidates_for_series(imdb_id: str, season: int, episode: int):
+    s = f"s{season:02d}"
+    e = f"e{episode:02d}"
+    return [
+        f"fenix-{imdb_id}-{s}-{e}",
+        f"fenix-{imdb_id}-{s}",
+        f"fenix-{imdb_id}",
+    ]
+
+
+def archive_pick_video(files, season: int | None = None, episode: int | None = None):
+    video_exts = (".mp4", ".mkv", ".avi", ".webm", ".mov", ".m4v")
+    episode_tags = []
+    if season is not None and episode is not None:
+        episode_tags = [
+            f"s{season:02d}e{episode:02d}",
+            f"{season}x{episode:02d}",
+            f"{season}x{episode}",
+        ]
+
+    best = None
+    best_score = -1
+
+    for f in files:
+        name = f.get("name", "")
+        lower = name.lower()
+        if not lower.endswith(video_exts):
+            continue
+
+        score = 0
+        for tag in episode_tags:
+            if tag in lower:
+                score += 100
+
+        if lower.endswith(".mp4"):
+            score += 5
+
+        if score > best_score:
+            best_score = score
+            best = name
+
+    return best
+
+
+def archive_lookup(identifier: str, season: int | None = None, episode: int | None = None):
+    cached = get_cache(archive_cache, f"{identifier}|{season}|{episode}")
+    if cached is not None:
+        return cached
+
+    try:
+        r = requests.get(f"https://archive.org/metadata/{identifier}", timeout=8)
+        if r.status_code != 200:
+            set_cache(archive_cache, f"{identifier}|{season}|{episode}", None, 1800)
+            return None
+
+        data = r.json()
+        files = data.get("files") or []
+        picked = archive_pick_video(files, season, episode)
+        if not picked:
+            set_cache(archive_cache, f"{identifier}|{season}|{episode}", None, 1800)
+            return None
+
+        result = {
+            "type": "archive",
+            "title": data.get("metadata", {}).get("title", identifier),
+            "url": f"https://archive.org/download/{identifier}/{quote(picked)}"
+        }
+        set_cache(archive_cache, f"{identifier}|{season}|{episode}", result, 1800)
+        return result
+    except Exception as e:
+        print("ARCHIVE ERRO:", e)
+        set_cache(archive_cache, f"{identifier}|{season}|{episode}", None, 1800)
+        return None
+
+
 async def fetch_messages():
     cached = get_cache(messages_cache, "all")
     if cached:
@@ -299,15 +442,9 @@ async def fetch_messages():
         if not (m.video or m.document):
             continue
 
-        # MUITO IMPORTANTE:
-        # Essas mídias são encaminhadas de um bot.
-        # Então a legenda/caption é a principal fonte.
         caption = (m.message or "").strip()
         file_name = m.file.name if getattr(m.file, "name", None) else ""
-
         raw = f"{caption} {file_name}".strip()
-
-        # título exibido: prioriza legenda do encaminhamento
         display_title = clean_title(caption) if caption else clean_title(file_name or raw)
 
         data.append({
@@ -320,20 +457,15 @@ async def fetch_messages():
             "year": extract_year(raw),
             "is_series": extract_is_series_like(raw),
             "series_tags": extract_series_tags(raw),
-            "complete_seasons": extract_complete_seasons(raw),
         })
 
-    set_cache(messages_cache, "all", data, MESSAGES_CACHE_TTL)
+    set_cache(messages_cache, "all", data, 180)
     return data
 
 
-async def find_movie(movie_id: str):
-    cached = get_cache(search_cache, movie_id)
-    if cached:
-        return cached
-
+async def find_movie_fallback(imdb_id: str):
     msgs = await fetch_messages()
-    meta = omdb_lookup(movie_id)
+    meta = omdb_lookup(imdb_id)
     wanted_title = meta.get("title", "")
     wanted_year = meta.get("year", "")
 
@@ -343,11 +475,11 @@ async def find_movie(movie_id: str):
     for m in msgs:
         score = 0
 
-        if movie_id.lower() in m["norm"]:
+        if imdb_id.lower() in m["norm"]:
             score += 180
 
-        score += score_text_against_title(m["title"], wanted_title, wanted_year)
-        score += score_text_against_title(m["raw"], wanted_title, wanted_year)
+        score += title_word_score(m["title"], wanted_title)
+        score += title_word_score(m["raw"], wanted_title)
 
         if wanted_year and m["year"] == wanted_year:
             score += 35
@@ -355,28 +487,27 @@ async def find_movie(movie_id: str):
         if m["is_series"]:
             score -= 150
 
-        if len(m["title"]) > 5:
-            score += 3
-
         if score > best_score:
             best_score = score
             best = m
 
-    print("MOVIE OMDB:", movie_id, wanted_title, wanted_year)
-    print("MOVIE BEST:", best_score, best["title"] if best else None)
+    if best_score >= 80 and best:
+        return {
+            "type": "telegram",
+            "id": best["id"],
+            "title": best["title"]
+        }
 
-    if best_score < 80:
-        best = None
+    # fallback archive
+    for identifier in archive_candidates_for_movie(imdb_id):
+        result = archive_lookup(identifier)
+        if result:
+            return result
 
-    set_cache(search_cache, movie_id, best, SEARCH_CACHE_TTL)
-    return best
+    return None
 
 
-async def find_series(series_id: str):
-    cached = get_cache(search_cache, series_id)
-    if cached:
-        return cached
-
+async def find_series_fallback(series_id: str):
     imdb_id, season, episode = parse_series_id(series_id)
     if season is None:
         return None
@@ -387,7 +518,6 @@ async def find_series(series_id: str):
 
     best = None
     best_score = -1
-
     exact_tags = [
         f"s{season:02d}e{episode:02d}",
         f"{season}x{episode:02d}",
@@ -397,13 +527,11 @@ async def find_series(series_id: str):
     for m in msgs:
         score = 0
 
-        # 1) Nome da série precisa bater forte
         name_score = title_word_score(m["caption"], show_title)
         name_score += title_word_score(m["raw"], show_title)
         name_score += title_word_score(m["title"], show_title)
         score += name_score
 
-        # 2) Episódio exato precisa bater forte
         tag_hits = 0
         for tag in exact_tags:
             if tag in m["norm"]:
@@ -414,36 +542,30 @@ async def find_series(series_id: str):
             score += 220
             tag_hits += 2
 
-        # 3) Pack de temporada só como fallback
-        if season in m["complete_seasons"]:
-            score += 20
-
-        # 4) Se parece série, bônus pequeno
         if m["is_series"]:
             score += 10
 
-        # 5) Regra crítica:
-        # se achou episódio mas o nome da série quase não bate,
-        # rejeita forte para não abrir Sherlock em Pokémon/TWD.
         if tag_hits > 0 and name_score < 40:
             score -= 220
-
-        # 6) Arquivo muito genérico perde pontos
-        if len(m["title"]) < 4:
-            score -= 20
 
         if score > best_score:
             best_score = score
             best = m
 
-    print("SERIES OMDB:", imdb_id, show_title, season, episode)
-    print("SERIES BEST:", best_score, best["title"] if best else None)
+    if best_score >= 140 and best:
+        return {
+            "type": "telegram",
+            "id": best["id"],
+            "title": best["title"]
+        }
 
-    if best_score < 140:
-        best = None
+    # fallback archive
+    for identifier in archive_candidates_for_series(imdb_id, season, episode):
+        result = archive_lookup(identifier, season, episode)
+        if result:
+            return result
 
-    set_cache(search_cache, series_id, best, SEARCH_CACHE_TTL)
-    return best
+    return None
 
 
 def build_display_title(item: dict, content_type: str, stremio_id: str) -> str:
@@ -454,6 +576,7 @@ def build_display_title(item: dict, content_type: str, stremio_id: str) -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    await init_db()
     await client.start()
     print("Telegram conectado")
     yield
@@ -461,7 +584,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -473,16 +595,16 @@ app.add_middleware(
 
 @app.get("/")
 def home():
-    return {"status": "ok", "version": "1.2.0"}
+    return {"status": "ok", "version": "2.2.0"}
 
 
 @app.get("/manifest.json")
 def manifest():
     return {
-        "id": "org.telaverde.telegram",
-        "version": "1.2.0",
+        "id": "org.telaverde.hybrid",
+        "version": "2.2.0",
         "name": "TelaVerde",
-        "description": "Stable mode + forwarded-caption aware series fix",
+        "description": "Registro exato + Telegram fallback + Archive fallback",
         "resources": ["stream"],
         "types": ["movie", "series"],
         "idPrefixes": ["tt"],
@@ -495,7 +617,96 @@ def refresh():
     messages_cache.clear()
     search_cache.clear()
     omdb_cache.clear()
+    archive_cache.clear()
     return {"status": "ok"}
+
+
+@app.get("/stream/movie/{imdb_id}.json")
+async def stream_movie(imdb_id: str):
+    # 1) registro exato
+    row = await get_registered_movie(imdb_id)
+    if row:
+        telegram_message_id, title = row
+        return {
+            "streams": [{
+                "name": "TelaVerde",
+                "title": title or imdb_id,
+                "url": f"{PUBLIC_BASE_URL}/video/{telegram_message_id}"
+            }]
+        }
+
+    # 2) fallback híbrido
+    item = await find_movie_fallback(imdb_id)
+    if not item:
+        return {"streams": []}
+
+    if item["type"] == "telegram":
+        return {
+            "streams": [{
+                "name": "TelaVerde",
+                "title": build_display_title(item, "movie", imdb_id),
+                "url": f"{PUBLIC_BASE_URL}/video/{item['id']}"
+            }]
+        }
+
+    if item["type"] == "archive":
+        return {
+            "streams": [{
+                "name": "TelaVerde",
+                "title": build_display_title(item, "movie", imdb_id),
+                "url": item["url"]
+            }]
+        }
+
+    return {"streams": []}
+
+
+@app.get("/stream/series/{series_id}.json")
+async def stream_series(series_id: str):
+    m = re.match(r"^(tt\d+):(\d+):(\d+)$", series_id)
+    if not m:
+        return {"streams": []}
+
+    imdb_id = m.group(1)
+    season = int(m.group(2))
+    episode = int(m.group(3))
+
+    # 1) registro exato
+    row = await get_registered_series(imdb_id, season, episode)
+    if row:
+        telegram_message_id, title = row
+        return {
+            "streams": [{
+                "name": "TelaVerde",
+                "title": title or f"{imdb_id} S{season:02d}E{episode:02d}",
+                "url": f"{PUBLIC_BASE_URL}/video/{telegram_message_id}"
+            }]
+        }
+
+    # 2) fallback híbrido
+    item = await find_series_fallback(series_id)
+    if not item:
+        return {"streams": []}
+
+    if item["type"] == "telegram":
+        return {
+            "streams": [{
+                "name": "TelaVerde",
+                "title": build_display_title(item, "series", series_id),
+                "url": f"{PUBLIC_BASE_URL}/video/{item['id']}"
+            }]
+        }
+
+    if item["type"] == "archive":
+        return {
+            "streams": [{
+                "name": "TelaVerde",
+                "title": build_display_title(item, "series", series_id),
+                "url": item["url"]
+            }]
+        }
+
+    return {"streams": []}
 
 
 @app.get("/video/{mid}")
@@ -528,10 +739,8 @@ async def video(mid: int, range: str | None = Header(None)):
             piece = chunk[:length - sent]
             if not piece:
                 break
-
             sent += len(piece)
             yield piece
-
             if sent >= length:
                 break
 
@@ -576,32 +785,3 @@ async def video_head(mid: int, range: str | None = Header(None)):
             "Cache-Control": "no-cache",
         },
     )
-
-
-@app.get("/stream/{content_type}/{id}.json")
-async def stream(content_type: str, id: str):
-    try:
-        try:
-            item = await (find_series(id) if content_type == "series" else find_movie(id))
-        except Exception as e:
-            print("ERRO FIND:", e)
-            traceback.print_exc()
-            return {"streams": []}
-
-        if not item:
-            return {"streams": []}
-
-        return {
-            "streams": [
-                {
-                    "name": "TelaVerde",
-                    "title": build_display_title(item, content_type, id),
-                    "url": f"{PUBLIC_BASE_URL}/video/{item['id']}"
-                }
-            ]
-        }
-
-    except Exception as e:
-        print("ERRO STREAM:", e)
-        traceback.print_exc()
-        return {"streams": []}
