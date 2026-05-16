@@ -349,36 +349,52 @@ def manifest():
 @app.get("/catalog/{type}/{catalog_id}.json")
 async def catalog(type: str, catalog_id: str):
 
+    # ============================================
+    # MOVIES
+    # ============================================
+
     if type == "movie":
 
         rows = await database.fetch_all(
             """
 
-            SELECT DISTINCT imdb_id, title
+            SELECT DISTINCT ON (imdb_id)
+
+                imdb_id,
+                title,
+                id
 
             FROM entries
 
             WHERE type='movie'
 
-            ORDER BY id DESC
+            ORDER BY imdb_id, id DESC
 
             LIMIT 100
 
             """
         )
 
+    # ============================================
+    # SERIES
+    # ============================================
+
     else:
 
         rows = await database.fetch_all(
             """
 
-            SELECT DISTINCT imdb_id, title
+            SELECT DISTINCT ON (imdb_id)
+
+                imdb_id,
+                title,
+                id
 
             FROM entries
 
             WHERE type='series'
 
-            ORDER BY id DESC
+            ORDER BY imdb_id, id DESC
 
             LIMIT 100
 
