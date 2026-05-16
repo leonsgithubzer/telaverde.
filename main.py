@@ -1,6 +1,7 @@
 import os
 import re
 import traceback
+from urllib.parse import quote
 from contextlib import asynccontextmanager
 
 import requests
@@ -13,9 +14,9 @@ from fastapi.responses import StreamingResponse
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
-# ============================================
+# =========================================================
 # CONFIG
-# ============================================
+# =========================================================
 
 API_ID = int(os.getenv("API_ID", 0))
 API_HASH = os.getenv("API_HASH", "")
@@ -33,21 +34,24 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 FIMOO_API_URL = "https://fenixflix-search.vercel.app/search"
 
-CHUNK_SIZE = 1024 * 128
+CHUNK_SIZE = 1024 * 1024 * 2
 
-# ============================================
-# TELEGRAM
-# ============================================
+# =========================================================
+# TELEGRAM CLIENT
+# =========================================================
 
 client = TelegramClient(
     StringSession(STRING_SESSION),
     API_ID,
-    API_HASH
+    API_HASH,
+    connection_retries=999,
+    retry_delay=2,
+    auto_reconnect=True
 )
 
-# ============================================
+# =========================================================
 # DATABASE
-# ============================================
+# =========================================================
 
 database = Database(DATABASE_URL)
 
@@ -76,11 +80,11 @@ async def init_db():
 
     """
 
-    await database.execute(query)
+    await database.execute(query=query)
 
-# ============================================
+# =========================================================
 # AUTO INDEXER
-# ============================================
+# =========================================================
 
 @client.on(events.NewMessage(chats=CHANNEL_ID))
 async def auto_index(event):
@@ -99,7 +103,7 @@ async def auto_index(event):
         if not filename:
             return
 
-        print(f"NOVO ARQUIVO: {filename}")
+        print(f"\nNOVO ARQUIVO: {filename}")
 
         clean_name = (
             filename
@@ -107,9 +111,8 @@ async def auto_index(event):
             .replace("_", " ")
         )
 
-        # remove tags comuns
         clean_name = re.sub(
-            r'1080p|720p|2160p|x264|x265|BluRay|WEBRip|WEB-DL|H264|H265',
+            r'1080p|720p|2160p|x264|x265|BluRay|WEBRip|WEB-DL|H264|H265|AAC|DUAL|DUBLADO',
             '',
             clean_name,
             flags=re.IGNORECASE
@@ -117,26 +120,58 @@ async def auto_index(event):
 
         clean_name = clean_name.strip()
 
-        print(f"BUSCANDO: {clean_name}")
+        imdb_id = None
+        title = filename
 
-        # ============================================
-        # CINEMETA SEARCH
-        # ============================================
+        content_type = "movie"
 
-        search_url = (
-            "https://v3-cinemeta.strem.io/catalog/movie/top/search="
-            + clean_name +
-            ".json"
+        season = None
+        episode = None
+
+        # =========================================================
+        # SERIES DETECTION
+        # =========================================================
+
+        match = re.search(
+            r'[Ss](\d{1,2})[Ee](\d{1,2})',
+            filename
         )
+
+        if match:
+
+            content_type = "series"
+
+            season = int(match.group(1))
+            episode = int(match.group(2))
+
+            query_name = re.sub(
+                r'[Ss]\d{1,2}[Ee]\d{1,2}',
+                '',
+                clean_name
+            ).strip()
+
+            search_url = (
+                "https://v3-cinemeta.strem.io/catalog/series/top/search="
+                + quote(query_name)
+                + ".json"
+            )
+
+        else:
+
+            search_url = (
+                "https://v3-cinemeta.strem.io/catalog/movie/top/search="
+                + quote(clean_name)
+                + ".json"
+            )
+
+        print(f"BUSCANDO: {search_url}")
 
         r = requests.get(
             search_url,
-            timeout=10
+            timeout=15
         )
 
-        imdb_id = None
-        title = filename
-        content_type = "movie"
+        print(r.text[:300])
 
         if r.status_code == 200:
 
@@ -152,56 +187,14 @@ async def auto_index(event):
 
                 print(f"ENCONTRADO: {title}")
 
-        # ============================================
-        # SERIES DETECT
-        # ============================================
-
-        season = None
-        episode = None
-
-        match = re.search(
-            r'[Ss](\d+)[Ee](\d+)',
-            filename
-        )
-
-        if match:
-
-            content_type = "series"
-
-            season = int(match.group(1))
-            episode = int(match.group(2))
-
-            search_url = (
-                "https://v3-cinemeta.strem.io/catalog/series/top/search="
-                + clean_name +
-                ".json"
-            )
-
-            r = requests.get(
-                search_url,
-                timeout=10
-            )
-
-            if r.status_code == 200:
-
-                data = r.json()
-
-                metas = data.get("metas", [])
-
-                if metas:
-
-                    imdb_id = metas[0]["id"]
-
-                    title = metas[0]["name"]
-
         if not imdb_id:
 
             print("NÃO ENCONTRADO")
             return
 
-        # ============================================
+        # =========================================================
         # SAVE
-        # ============================================
+        # =========================================================
 
         await database.execute(
             """
@@ -242,9 +235,9 @@ async def auto_index(event):
     except:
         print(traceback.format_exc())
 
-# ============================================
-# FASTAPI
-# ============================================
+# =========================================================
+# FASTAPI LIFESPAN
+# =========================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -263,6 +256,10 @@ async def lifespan(app: FastAPI):
 
     await client.disconnect()
 
+# =========================================================
+# FASTAPI
+# =========================================================
+
 app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
@@ -272,86 +269,72 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-# ============================================
+# =========================================================
 # ROOT
-# ============================================
+# =========================================================
 
 @app.get("/")
 async def root():
 
     return {
         "status": "online",
-        "telegram_connected":
-            client.is_connected()
+        "telegram_connected": client.is_connected()
     }
 
-# ============================================
+# =========================================================
 # MANIFEST
-# ============================================
+# =========================================================
 
 @app.get("/manifest.json")
 def manifest():
 
     return {
 
-        "id":
-            "org.telaverde.hybrid",
+        "id": "org.telaverde.hybrid",
 
-        "version":
-            "5.0.0",
+        "version": "6.0.0",
 
-        "name":
-            "TelaVerde Auto",
+        "name": "TelaVerde Ultra",
 
-        "description":
-            "Telegram Auto Indexer + Cinemeta",
+        "description": "Telegram Auto Index + PostgreSQL + Cinemeta",
 
-        "resources":
-            [
-                "stream",
-                "catalog",
-                "meta"
-            ],
+        "resources": [
+            "stream",
+            "catalog",
+            "meta"
+        ],
 
-        "types":
-            [
-                "movie",
-                "series"
-            ],
+        "types": [
+            "movie",
+            "series"
+        ],
 
-        "idPrefixes":
-            [
-                "tt"
-            ],
+        "idPrefixes": [
+            "tt"
+        ],
 
-        "catalogs":
+        "catalogs": [
 
-            [
+            {
+                "type": "movie",
+                "id": "telaverde_movies",
+                "name": "🎬 Filmes"
+            },
 
-                {
-                    "type": "movie",
-                    "id": "telaverde_movies",
-                    "name": "🎬 Filmes"
-                },
-
-                {
-                    "type": "series",
-                    "id": "telaverde_series",
-                    "name": "📺 Séries"
-                }
-            ]
+            {
+                "type": "series",
+                "id": "telaverde_series",
+                "name": "📺 Séries"
+            }
+        ]
     }
 
-# ============================================
+# =========================================================
 # CATALOG
-# ============================================
+# =========================================================
 
 @app.get("/catalog/{type}/{catalog_id}.json")
 async def catalog(type: str, catalog_id: str):
-
-    # ============================================
-    # MOVIES
-    # ============================================
 
     if type == "movie":
 
@@ -375,10 +358,6 @@ async def catalog(type: str, catalog_id: str):
             """
         )
 
-    # ============================================
-    # SERIES
-    # ============================================
-
     else:
 
         rows = await database.fetch_all(
@@ -388,6 +367,8 @@ async def catalog(type: str, catalog_id: str):
 
                 imdb_id,
                 title,
+                season,
+                episode,
                 id
 
             FROM entries
@@ -405,16 +386,25 @@ async def catalog(type: str, catalog_id: str):
 
     for row in rows:
 
+        if type == "series":
+
+            meta_id = (
+                f"{row['imdb_id']}:"
+                f"{row['season']}:"
+                f"{row['episode']}"
+            )
+
+        else:
+
+            meta_id = row["imdb_id"]
+
         metas.append({
 
-            "id":
-                row["imdb_id"],
+            "id": meta_id,
 
-            "type":
-                type,
+            "type": type,
 
-            "name":
-                row["title"],
+            "name": row["title"],
 
             "poster":
                 "https://via.placeholder.com/300x450.png?text=TelaVerde"
@@ -424,12 +414,14 @@ async def catalog(type: str, catalog_id: str):
         "metas": metas
     }
 
-# ============================================
+# =========================================================
 # META
-# ============================================
+# =========================================================
 
 @app.get("/meta/{type}/{imdb_id}.json")
 async def meta(type: str, imdb_id: str):
+
+    imdb_clean = imdb_id.split(":")[0]
 
     row = await database.fetch_one(
         """
@@ -444,11 +436,11 @@ async def meta(type: str, imdb_id: str):
 
         """,
         {
-            "imdb_id": imdb_id
+            "imdb_id": imdb_clean
         }
     )
 
-    title = imdb_id
+    title = imdb_clean
 
     if row:
         title = row["title"]
@@ -457,23 +449,20 @@ async def meta(type: str, imdb_id: str):
 
         "meta": {
 
-            "id":
-                imdb_id,
+            "id": imdb_id,
 
-            "type":
-                type,
+            "type": type,
 
-            "name":
-                title,
+            "name": title,
 
             "poster":
                 "https://via.placeholder.com/300x450.png?text=TelaVerde"
         }
     }
 
-# ============================================
+# =========================================================
 # STREAM
-# ============================================
+# =========================================================
 
 @app.get("/stream/{type}/{stremio_id}.json")
 async def stream_handler(
@@ -492,10 +481,6 @@ async def stream_handler(
     season = None
     episode = None
 
-    # ============================================
-    # SERIES FORMAT
-    # ============================================
-
     if type == "series":
 
         parts = stremio_id.split(":")
@@ -508,9 +493,9 @@ async def stream_handler(
 
             episode = int(parts[2])
 
-    # ============================================
+    # =========================================================
     # LOCAL SEARCH
-    # ============================================
+    # =========================================================
 
     if type == "movie":
 
@@ -556,9 +541,9 @@ async def stream_handler(
             }
         )
 
-    # ============================================
+    # =========================================================
     # FOUND
-    # ============================================
+    # =========================================================
 
     if row:
 
@@ -580,9 +565,9 @@ async def stream_handler(
             ]
         }
 
-    # ============================================
+    # =========================================================
     # FIMOO FALLBACK
-    # ============================================
+    # =========================================================
 
     try:
 
@@ -634,9 +619,9 @@ async def stream_handler(
         "streams": []
     }
 
-# ============================================
+# =========================================================
 # VIDEO PROXY
-# ============================================
+# =========================================================
 
 @app.get("/video/{message_id}")
 async def video_proxy(
@@ -657,30 +642,43 @@ async def video_proxy(
         file_size = msg.file.size
 
         start = 0
+        end = file_size - 1
 
         if range:
 
             match = re.search(
-                r"bytes=(\d+)-",
+                r"bytes=(\d+)-(\d*)",
                 range
             )
 
             if match:
+
                 start = int(match.group(1))
 
-        headers = {
+                if match.group(2):
+                    end = int(match.group(2))
 
-            "Content-Range":
-                f"bytes {start}-{file_size-1}/{file_size}",
+        chunk_size = end - start + 1
+
+        headers = {
 
             "Accept-Ranges":
                 "bytes",
 
+            "Content-Range":
+                f"bytes {start}-{end}/{file_size}",
+
+            "Content-Length":
+                str(chunk_size),
+
             "Content-Type":
-                msg.file.mime_type or "video/mp4"
+                msg.file.mime_type or "video/mp4",
+
+            "Cache-Control":
+                "public, max-age=3600"
         }
 
-        async def stream_generator():
+        async def stream():
 
             async for chunk in client.iter_download(
                 msg.media,
@@ -690,12 +688,13 @@ async def video_proxy(
                 yield chunk
 
         return StreamingResponse(
-            stream_generator(),
+            stream(),
             status_code=206,
             headers=headers
         )
 
-    except:
+    except Exception as e:
+
         print(traceback.format_exc())
 
-        return Response(status_code=404)
+        return Response(status_code=500)
