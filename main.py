@@ -1,3 +1,7 @@
+# =========================================================
+# IMPORTS
+# =========================================================
+
 import os
 import re
 import traceback
@@ -7,8 +11,11 @@ from contextlib import asynccontextmanager
 import requests
 
 from databases import Database
+
 from fastapi import FastAPI, Header, Response
+
 from fastapi.middleware.cors import CORSMiddleware
+
 from fastapi.responses import StreamingResponse
 
 from telethon import TelegramClient, events
@@ -19,6 +26,7 @@ from telethon.sessions import StringSession
 # =========================================================
 
 API_ID = int(os.getenv("API_ID", 0))
+
 API_HASH = os.getenv("API_HASH", "")
 
 STRING_SESSION = os.getenv("STRING_SESSION", "")
@@ -41,19 +49,42 @@ CHUNK_SIZE = 1024 * 1024 * 2
 # =========================================================
 
 client = TelegramClient(
+
     StringSession(STRING_SESSION),
+
     API_ID,
+
     API_HASH,
-    connection_retries=999,
+
+    connection_retries=None,
+
     retry_delay=2,
-    auto_reconnect=True
+
+    auto_reconnect=True,
+
+    request_retries=10,
+
+    flood_sleep_threshold=60
 )
 
 # =========================================================
 # DATABASE
 # =========================================================
 
-database = Database(DATABASE_URL)
+database = Database(
+
+    DATABASE_URL,
+
+    min_size=1,
+
+    max_size=5,
+
+    timeout=60
+)
+
+# =========================================================
+# INIT DB
+# =========================================================
 
 async def init_db():
 
@@ -121,16 +152,18 @@ async def auto_index(event):
         clean_name = clean_name.strip()
 
         imdb_id = None
+
         title = filename
 
         content_type = "movie"
 
         season = None
+
         episode = None
 
-        # =========================================================
+        # =====================================================
         # SERIES DETECTION
-        # =========================================================
+        # =====================================================
 
         match = re.search(
             r'[Ss](\d{1,2})[Ee](\d{1,2})',
@@ -142,6 +175,7 @@ async def auto_index(event):
             content_type = "series"
 
             season = int(match.group(1))
+
             episode = int(match.group(2))
 
             query_name = re.sub(
@@ -192,9 +226,9 @@ async def auto_index(event):
             print("NÃO ENCONTRADO")
             return
 
-        # =========================================================
+        # =====================================================
         # SAVE
-        # =========================================================
+        # =====================================================
 
         await database.execute(
             """
@@ -277,8 +311,11 @@ app.add_middleware(
 async def root():
 
     return {
+
         "status": "online",
-        "telegram_connected": client.is_connected()
+
+        "telegram_connected":
+            client.is_connected()
     }
 
 # =========================================================
@@ -290,41 +327,58 @@ def manifest():
 
     return {
 
-        "id": "org.telaverde.hybrid",
+        "id":
+            "org.telaverde.hybrid",
 
-        "version": "6.0.0",
+        "version":
+            "7.0.0",
 
-        "name": "TelaVerde Ultra",
+        "name":
+            "TelaVerde Ultra",
 
-        "description": "Telegram Auto Index + PostgreSQL + Cinemeta",
+        "description":
+            "Telegram Streaming + PostgreSQL",
 
         "resources": [
+
             "stream",
             "catalog",
             "meta"
         ],
 
         "types": [
+
             "movie",
             "series"
         ],
 
         "idPrefixes": [
+
             "tt"
         ],
 
         "catalogs": [
 
             {
-                "type": "movie",
-                "id": "telaverde_movies",
-                "name": "🎬 Filmes"
+                "type":
+                    "movie",
+
+                "id":
+                    "telaverde_movies",
+
+                "name":
+                    "🎬 Filmes"
             },
 
             {
-                "type": "series",
-                "id": "telaverde_series",
-                "name": "📺 Séries"
+                "type":
+                    "series",
+
+                "id":
+                    "telaverde_series",
+
+                "name":
+                    "📺 Séries"
             }
         ]
     }
@@ -400,11 +454,14 @@ async def catalog(type: str, catalog_id: str):
 
         metas.append({
 
-            "id": meta_id,
+            "id":
+                meta_id,
 
-            "type": type,
+            "type":
+                type,
 
-            "name": row["title"],
+            "name":
+                row["title"],
 
             "poster":
                 "https://via.placeholder.com/300x450.png?text=TelaVerde"
@@ -449,11 +506,14 @@ async def meta(type: str, imdb_id: str):
 
         "meta": {
 
-            "id": imdb_id,
+            "id":
+                imdb_id,
 
-            "type": type,
+            "type":
+                type,
 
-            "name": title,
+            "name":
+                title,
 
             "poster":
                 "https://via.placeholder.com/300x450.png?text=TelaVerde"
@@ -493,9 +553,9 @@ async def stream_handler(
 
             episode = int(parts[2])
 
-    # =========================================================
-    # LOCAL SEARCH
-    # =========================================================
+    # =====================================================
+    # MOVIE SEARCH
+    # =====================================================
 
     if type == "movie":
 
@@ -516,6 +576,10 @@ async def stream_handler(
                 "imdb_id": imdb_id
             }
         )
+
+    # =====================================================
+    # SERIES SEARCH
+    # =====================================================
 
     else:
 
@@ -541,9 +605,9 @@ async def stream_handler(
             }
         )
 
-    # =========================================================
-    # FOUND
-    # =========================================================
+    # =====================================================
+    # FOUND LOCAL
+    # =====================================================
 
     if row:
 
@@ -565,9 +629,9 @@ async def stream_handler(
             ]
         }
 
-    # =========================================================
+    # =====================================================
     # FIMOO FALLBACK
-    # =========================================================
+    # =====================================================
 
     try:
 
@@ -642,6 +706,7 @@ async def video_proxy(
         file_size = msg.file.size
 
         start = 0
+
         end = file_size - 1
 
         if range:
@@ -681,19 +746,26 @@ async def video_proxy(
         async def stream():
 
             async for chunk in client.iter_download(
+
                 msg.media,
+
                 offset=start,
+
                 request_size=CHUNK_SIZE
+
             ):
                 yield chunk
 
         return StreamingResponse(
+
             stream(),
+
             status_code=206,
+
             headers=headers
         )
 
-    except Exception as e:
+    except Exception:
 
         print(traceback.format_exc())
 
