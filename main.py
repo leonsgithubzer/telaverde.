@@ -3,29 +3,41 @@ import re
 import traceback
 from contextlib import asynccontextmanager
 
-import aiosqlite
 import requests
+
+from databases import Database
 from fastapi import FastAPI, Header, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
-# =========================
+# ============================================
 # CONFIG
-# =========================
+# ============================================
 
 API_ID = int(os.getenv("API_ID", 0))
 API_HASH = os.getenv("API_HASH", "")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", 0))
+
 STRING_SESSION = os.getenv("STRING_SESSION", "")
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", 0))
+
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", 0))
+
+PUBLIC_BASE_URL = os.getenv(
+    "PUBLIC_BASE_URL",
+    ""
+).rstrip("/")
+
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 FIMOO_API_URL = "https://fenixflix-search.vercel.app/search"
 
-DB_PATH = "registry.db"
-CHUNK_SIZE = 128 * 1024
+CHUNK_SIZE = 1024 * 128
+
+# ============================================
+# TELEGRAM
+# ============================================
 
 client = TelegramClient(
     StringSession(STRING_SESSION),
@@ -33,139 +45,221 @@ client = TelegramClient(
     API_HASH
 )
 
-# =========================
+# ============================================
 # DATABASE
-# =========================
+# ============================================
+
+database = Database(DATABASE_URL)
 
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
 
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS entries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+    query = """
 
-            imdb_id TEXT NOT NULL,
-            title TEXT,
-            type TEXT NOT NULL,
+    CREATE TABLE IF NOT EXISTS entries (
 
-            season INTEGER,
-            episode INTEGER,
+        id SERIAL PRIMARY KEY,
 
-            message_id INTEGER NOT NULL
-        )
-        """)
+        imdb_id TEXT NOT NULL,
 
-        await db.commit()
+        title TEXT,
 
-# =========================
-# BOT COMMANDS
-# =========================
+        type TEXT NOT NULL,
 
-@client.on(events.NewMessage(pattern=r'^/addmovie\s+(tt\d+)$'))
-async def add_movie(event):
+        season INTEGER,
 
-    if event.sender_id != ADMIN_USER_ID:
-        return
+        episode INTEGER,
 
-    replied = await event.get_reply_message()
+        message_id BIGINT NOT NULL,
 
-    if not replied or not replied.media:
-        await event.reply(
-            "❌ Responda a um vídeo com:\n/addmovie tt1234567"
-        )
-        return
-
-    imdb_id = event.pattern_match.group(1)
-
-    title = (
-        getattr(replied.file, 'name', None)
-        or "Filme"
+        created_at TIMESTAMP DEFAULT NOW()
     )
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    """
 
-        await db.execute("""
-        INSERT INTO entries
-        (imdb_id, title, type, message_id)
-        VALUES (?, ?, 'movie', ?)
-        """, (
-            imdb_id,
-            title,
-            replied.id
-        ))
+    await database.execute(query)
 
-        await db.commit()
+# ============================================
+# AUTO INDEXER
+# ============================================
 
-    await event.reply(f"✅ Filme adicionado:\n{title}")
+@client.on(events.NewMessage(chats=CHANNEL_ID))
+async def auto_index(event):
 
+    try:
 
-@client.on(events.NewMessage(
-    pattern=r'^/addseries\s+(tt\d+)\s+S(\d+)E(\d+)$'
-))
-async def add_series(event):
+        if not event.media:
+            return
 
-    if event.sender_id != ADMIN_USER_ID:
-        return
-
-    replied = await event.get_reply_message()
-
-    if not replied or not replied.media:
-        await event.reply(
-            "❌ Responda a um vídeo com:\n/addseries tt1234567 S1E1"
+        filename = getattr(
+            event.file,
+            "name",
+            None
         )
-        return
 
-    imdb_id, season, episode = event.pattern_match.groups()
+        if not filename:
+            return
 
-    season = int(season)
-    episode = int(episode)
+        print(f"NOVO ARQUIVO: {filename}")
 
-    title = (
-        getattr(replied.file, 'name', None)
-        or f"S{season}E{episode}"
-    )
-
-    async with aiosqlite.connect(DB_PATH) as db:
-
-        await db.execute("""
-        INSERT INTO entries
-        (
-            imdb_id,
-            title,
-            type,
-            season,
-            episode,
-            message_id
+        clean_name = (
+            filename
+            .replace(".", " ")
+            .replace("_", " ")
         )
-        VALUES (?, ?, 'series', ?, ?, ?)
-        """, (
-            imdb_id,
-            title,
-            season,
-            episode,
-            replied.id
-        ))
 
-        await db.commit()
+        # remove tags comuns
+        clean_name = re.sub(
+            r'1080p|720p|2160p|x264|x265|BluRay|WEBRip|WEB-DL|H264|H265',
+            '',
+            clean_name,
+            flags=re.IGNORECASE
+        )
 
-    await event.reply(
-        f"✅ Episódio adicionado:\n{title}"
-    )
+        clean_name = clean_name.strip()
 
-# =========================
+        print(f"BUSCANDO: {clean_name}")
+
+        # ============================================
+        # CINEMETA SEARCH
+        # ============================================
+
+        search_url = (
+            "https://v3-cinemeta.strem.io/catalog/movie/top/search="
+            + clean_name +
+            ".json"
+        )
+
+        r = requests.get(
+            search_url,
+            timeout=10
+        )
+
+        imdb_id = None
+        title = filename
+        content_type = "movie"
+
+        if r.status_code == 200:
+
+            data = r.json()
+
+            metas = data.get("metas", [])
+
+            if metas:
+
+                imdb_id = metas[0]["id"]
+
+                title = metas[0]["name"]
+
+                print(f"ENCONTRADO: {title}")
+
+        # ============================================
+        # SERIES DETECT
+        # ============================================
+
+        season = None
+        episode = None
+
+        match = re.search(
+            r'[Ss](\d+)[Ee](\d+)',
+            filename
+        )
+
+        if match:
+
+            content_type = "series"
+
+            season = int(match.group(1))
+            episode = int(match.group(2))
+
+            search_url = (
+                "https://v3-cinemeta.strem.io/catalog/series/top/search="
+                + clean_name +
+                ".json"
+            )
+
+            r = requests.get(
+                search_url,
+                timeout=10
+            )
+
+            if r.status_code == 200:
+
+                data = r.json()
+
+                metas = data.get("metas", [])
+
+                if metas:
+
+                    imdb_id = metas[0]["id"]
+
+                    title = metas[0]["name"]
+
+        if not imdb_id:
+
+            print("NÃO ENCONTRADO")
+            return
+
+        # ============================================
+        # SAVE
+        # ============================================
+
+        await database.execute(
+            """
+
+            INSERT INTO entries
+            (
+                imdb_id,
+                title,
+                type,
+                season,
+                episode,
+                message_id
+            )
+
+            VALUES
+            (
+                :imdb_id,
+                :title,
+                :type,
+                :season,
+                :episode,
+                :message_id
+            )
+
+            """,
+            {
+                "imdb_id": imdb_id,
+                "title": title,
+                "type": content_type,
+                "season": season,
+                "episode": episode,
+                "message_id": event.id
+            }
+        )
+
+        print("SALVO AUTOMATICAMENTE")
+
+    except:
+        print(traceback.format_exc())
+
+# ============================================
 # FASTAPI
-# =========================
+# ============================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+
+    await database.connect()
 
     await init_db()
 
     await client.start()
 
-    print("✅ Bot online")
+    print("BOT ONLINE")
 
     yield
+
+    await database.disconnect()
 
     await client.disconnect()
 
@@ -178,105 +272,133 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-# =========================
+# ============================================
 # ROOT
-# =========================
+# ============================================
 
 @app.get("/")
 async def root():
 
     return {
         "status": "online",
-        "telegram_connected": client.is_connected()
+        "telegram_connected":
+            client.is_connected()
     }
 
-# =========================
+# ============================================
 # MANIFEST
-# =========================
+# ============================================
 
 @app.get("/manifest.json")
 def manifest():
 
     return {
-        "id": "org.telaverde.hybrid",
-        "version": "4.0.0",
 
-        "name": "TelaVerde VIP",
+        "id":
+            "org.telaverde.hybrid",
+
+        "version":
+            "5.0.0",
+
+        "name":
+            "TelaVerde Auto",
 
         "description":
-            "Telegram + Fimoo Hybrid Addon",
+            "Telegram Auto Indexer + Cinemeta",
 
-        "resources": [
-            "stream",
-            "catalog",
-            "meta"
-        ],
+        "resources":
+            [
+                "stream",
+                "catalog",
+                "meta"
+            ],
 
-        "types": [
-            "movie",
-            "series"
-        ],
+        "types":
+            [
+                "movie",
+                "series"
+            ],
 
-        "idPrefixes": [
-            "tt"
-        ],
+        "idPrefixes":
+            [
+                "tt"
+            ],
 
-        "catalogs": [
+        "catalogs":
 
-            {
-                "type": "movie",
-                "id": "telaverde_movies",
-                "name": "🎬 TelaVerde Filmes"
-            },
+            [
 
-            {
-                "type": "series",
-                "id": "telaverde_series",
-                "name": "📺 TelaVerde Séries"
-            }
-        ]
+                {
+                    "type": "movie",
+                    "id": "telaverde_movies",
+                    "name": "🎬 Filmes"
+                },
+
+                {
+                    "type": "series",
+                    "id": "telaverde_series",
+                    "name": "📺 Séries"
+                }
+            ]
     }
 
-# =========================
+# ============================================
 # CATALOG
-# =========================
+# ============================================
 
 @app.get("/catalog/{type}/{catalog_id}.json")
 async def catalog(type: str, catalog_id: str):
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    if type == "movie":
 
-        if type == "movie":
+        rows = await database.fetch_all(
+            """
 
-            cur = await db.execute("""
-            SELECT imdb_id, title
+            SELECT DISTINCT imdb_id, title
+
             FROM entries
+
             WHERE type='movie'
+
             ORDER BY id DESC
+
             LIMIT 100
-            """)
 
-        else:
+            """
+        )
 
-            cur = await db.execute("""
-            SELECT imdb_id, title
+    else:
+
+        rows = await database.fetch_all(
+            """
+
+            SELECT DISTINCT imdb_id, title
+
             FROM entries
-            WHERE type='series'
-            GROUP BY imdb_id
-            ORDER BY id DESC
-            LIMIT 100
-            """)
 
-        rows = await cur.fetchall()
+            WHERE type='series'
+
+            ORDER BY id DESC
+
+            LIMIT 100
+
+            """
+        )
 
     metas = []
 
-    for imdb_id, title in rows:
+    for row in rows:
 
         metas.append({
-            "id": imdb_id,
-            "type": type,
-            "name": title,
+
+            "id":
+                row["imdb_id"],
+
+            "type":
+                type,
+
+            "name":
+                row["title"],
 
             "poster":
                 "https://via.placeholder.com/300x450.png?text=TelaVerde"
@@ -286,43 +408,62 @@ async def catalog(type: str, catalog_id: str):
         "metas": metas
     }
 
-# =========================
+# ============================================
 # META
-# =========================
+# ============================================
 
 @app.get("/meta/{type}/{imdb_id}.json")
 async def meta(type: str, imdb_id: str):
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    row = await database.fetch_one(
+        """
 
-        cur = await db.execute("""
         SELECT title
+
         FROM entries
-        WHERE imdb_id=?
+
+        WHERE imdb_id=:imdb_id
+
         LIMIT 1
-        """, (imdb_id,))
 
-        row = await cur.fetchone()
+        """,
+        {
+            "imdb_id": imdb_id
+        }
+    )
 
-    title = row[0] if row else imdb_id
+    title = imdb_id
+
+    if row:
+        title = row["title"]
 
     return {
+
         "meta": {
-            "id": imdb_id,
-            "type": type,
-            "name": title,
+
+            "id":
+                imdb_id,
+
+            "type":
+                type,
+
+            "name":
+                title,
 
             "poster":
                 "https://via.placeholder.com/300x450.png?text=TelaVerde"
         }
     }
 
-# =========================
+# ============================================
 # STREAM
-# =========================
+# ============================================
 
 @app.get("/stream/{type}/{stremio_id}.json")
-async def stream_handler(type: str, stremio_id: str):
+async def stream_handler(
+    type: str,
+    stremio_id: str
+):
 
     stremio_id = (
         stremio_id
@@ -335,8 +476,9 @@ async def stream_handler(type: str, stremio_id: str):
     season = None
     episode = None
 
-    # SERIES FORMAT:
-    # tt123456:1:2
+    # ============================================
+    # SERIES FORMAT
+    # ============================================
 
     if type == "series":
 
@@ -345,63 +487,86 @@ async def stream_handler(type: str, stremio_id: str):
         if len(parts) >= 3:
 
             imdb_id = parts[0]
+
             season = int(parts[1])
+
             episode = int(parts[2])
 
-    # =========================
+    # ============================================
     # LOCAL SEARCH
-    # =========================
+    # ============================================
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    if type == "movie":
 
-        if type == "movie":
+        row = await database.fetch_one(
+            """
 
-            cur = await db.execute("""
             SELECT message_id, title
+
             FROM entries
-            WHERE imdb_id=?
+
+            WHERE imdb_id=:imdb_id
             AND type='movie'
+
             LIMIT 1
-            """, (imdb_id,))
 
-        else:
+            """,
+            {
+                "imdb_id": imdb_id
+            }
+        )
 
-            cur = await db.execute("""
+    else:
+
+        row = await database.fetch_one(
+            """
+
             SELECT message_id, title
-            FROM entries
-            WHERE imdb_id=?
-            AND season=?
-            AND episode=?
-            AND type='series'
-            LIMIT 1
-            """, (
-                imdb_id,
-                season,
-                episode
-            ))
 
-        row = await cur.fetchone()
+            FROM entries
+
+            WHERE imdb_id=:imdb_id
+            AND type='series'
+            AND season=:season
+            AND episode=:episode
+
+            LIMIT 1
+
+            """,
+            {
+                "imdb_id": imdb_id,
+                "season": season,
+                "episode": episode
+            }
+        )
+
+    # ============================================
+    # FOUND
+    # ============================================
 
     if row:
 
-        message_id, title = row
-
         return {
-            "streams": [
-                {
-                    "name": "🟢 TelaVerde",
 
-                    "title": title,
+            "streams": [
+
+                {
+
+                    "name":
+                        "🟢 TelaVerde",
+
+                    "title":
+                        row["title"],
 
                     "url":
-                        f"{PUBLIC_BASE_URL}/video/{message_id}"
+                        f"{PUBLIC_BASE_URL}/video/{row['message_id']}"
                 }
             ]
         }
 
-    # =========================
+    # ============================================
     # FIMOO FALLBACK
-    # =========================
+    # ============================================
 
     try:
 
@@ -411,7 +576,10 @@ async def stream_handler(type: str, stremio_id: str):
             type == "series"
             and season is not None
         ):
-            query = f"{imdb_id}:{season}:{episode}"
+
+            query = (
+                f"{imdb_id}:{season}:{episode}"
+            )
 
         r = requests.get(
             f"{FIMOO_API_URL}/{query}",
@@ -423,9 +591,13 @@ async def stream_handler(type: str, stremio_id: str):
             data = r.json()
 
             return {
+
                 "streams": [
+
                     {
-                        "name": "🔥 Fimoo Search",
+
+                        "name":
+                            "🔥 Fimoo",
 
                         "title":
                             data.get(
@@ -446,9 +618,9 @@ async def stream_handler(type: str, stremio_id: str):
         "streams": []
     }
 
-# =========================
+# ============================================
 # VIDEO PROXY
-# =========================
+# ============================================
 
 @app.get("/video/{message_id}")
 async def video_proxy(
@@ -509,4 +681,5 @@ async def video_proxy(
 
     except:
         print(traceback.format_exc())
+
         return Response(status_code=404)
