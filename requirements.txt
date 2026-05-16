@@ -1,5 +1,8 @@
 fastapi
-uvicorn[standard]
+uvicorn
 telethon
-requests
 aiosqlite
+requests
+python-multipart
+tgcrypto
+cryptg
