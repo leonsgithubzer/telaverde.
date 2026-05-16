@@ -1,8 +1,10 @@
 fastapi
 uvicorn
 telethon
-aiosqlite
 requests
 python-multipart
 tgcrypto
 cryptg
+databases
+asyncpg
+sqlalchemy
