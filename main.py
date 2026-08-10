@@ -50,14 +50,15 @@ client = TelegramClient(
 )
 
 # =========================================================
-# DATABASE
+# DATABASE (CORRIGIDO PARA PGBOUNCER DO SUPABASE)
 # =========================================================
 
 database = Database(
     DATABASE_URL,
     min_size=1,
     max_size=5,
-    timeout=60
+    timeout=60,
+    statement_cache_size=0
 )
 
 # =========================================================
