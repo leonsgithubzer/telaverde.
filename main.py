@@ -50,7 +50,7 @@ client = TelegramClient(
 )
 
 # =========================================================
-# DATABASE (CORRIGIDO PARA PGBOUNCER DO SUPABASE)
+# DATABASE
 # =========================================================
 
 database = Database(
@@ -81,6 +81,51 @@ async def init_db():
     await database.execute(query=query)
 
 # =========================================================
+# HELPER DE EXTRAÇÃO DE MÍDIA (SUPORTE AMPLIADO A REGEX)
+# =========================================================
+
+def parse_media_filename(filename: str):
+    clean_name = filename.replace(".", " ").replace("_", " ")
+    clean_name = re.sub(
+        r'1080p|720p|2160p|4k|x264|x265|BluRay|WEBRip|WEB-DL|H264|H265|AAC|DUAL|DUBLADO|LEGENDADO',
+        '',
+        clean_name,
+        flags=re.IGNORECASE
+    ).strip()
+
+    content_type = "movie"
+    season = None
+    episode = None
+    query_name = clean_name
+
+    # Padrão 1: S01E01 / s1e1 / S01.E01
+    match_se = re.search(r'[Ss](\d{1,2})[\s._-]*[Ee](\d{1,2})', filename)
+    
+    # Padrão 2: 1x01 / 01x01
+    match_x = re.search(r'(\d{1,2})[Xx](\d{1,2})', filename)
+    
+    # Padrão 3: E01 / Episodio 01 (Assume temporada 1)
+    match_ep = re.search(r'(?:[Ee]|Episodio|Ep)[\s._-]*(\d{1,2})', filename, re.IGNORECASE)
+
+    if match_se:
+        content_type = "series"
+        season = int(match_se.group(1))
+        episode = int(match_se.group(2))
+        query_name = re.sub(r'[Ss]\d{1,2}[\s._-]*[Ee]\d{1,2}', '', clean_name).strip()
+    elif match_x:
+        content_type = "series"
+        season = int(match_x.group(1))
+        episode = int(match_x.group(2))
+        query_name = re.sub(r'\d{1,2}[Xx]\d{1,2}', '', clean_name).strip()
+    elif match_ep:
+        content_type = "series"
+        season = 1
+        episode = int(match_ep.group(1))
+        query_name = re.sub(r'(?:[Ee]|Episodio|Ep)[\s._-]*\d{1,2}', '', clean_name, flags=re.IGNORECASE).strip()
+
+    return content_type, season, episode, query_name
+
+# =========================================================
 # AUTO INDEXER
 # =========================================================
 
@@ -96,52 +141,26 @@ async def auto_index(event):
 
         print(f"\nNOVO ARQUIVO: {filename}")
 
-        clean_name = filename.replace(".", " ").replace("_", " ")
-        clean_name = re.sub(
-            r'1080p|720p|2160p|x264|x265|BluRay|WEBRip|WEB-DL|H264|H265|AAC|DUAL|DUBLADO',
-            '',
-            clean_name,
-            flags=re.IGNORECASE
-        ).strip()
+        content_type, season, episode, query_name = parse_media_filename(filename)
 
-        imdb_id = None
-        title = filename
-        content_type = "movie"
-        season = None
-        episode = None
-
-        match = re.search(r'[Ss](\d{1,2})[Ee](\d{1,2})', filename)
-
-        if match:
-            content_type = "series"
-            season = int(match.group(1))
-            episode = int(match.group(2))
-            query_name = re.sub(r'[Ss]\d{1,2}[Ee]\d{1,2}', '', clean_name).strip()
-            search_url = (
-                "https://v3-cinemeta.strem.io/catalog/series/top/search="
-                + quote(query_name)
-                + ".json"
-            )
+        if content_type == "series":
+            search_url = f"https://v3-cinemeta.strem.io/catalog/series/top/search={quote(query_name)}.json"
         else:
-            search_url = (
-                "https://v3-cinemeta.strem.io/catalog/movie/top/search="
-                + quote(clean_name)
-                + ".json"
-            )
-
-        print(f"BUSCANDO: {search_url}")
+            search_url = f"https://v3-cinemeta.strem.io/catalog/movie/top/search={quote(query_name)}.json"
 
         r = requests.get(search_url, timeout=15)
+        imdb_id = None
+        title = filename
 
         if r.status_code == 200:
             metas = r.json().get("metas", [])
             if metas:
                 imdb_id = metas[0]["id"]
                 title = metas[0]["name"]
-                print(f"ENCONTRADO: {title}")
+                print(f"ENCONTRADO: {title} (T{season}E{episode})")
 
         if not imdb_id:
-            print("NÃO ENCONTRADO")
+            print(f"NÃO ENCONTRADO NO CINEMETA: {filename}")
             return
 
         await database.execute(
@@ -161,7 +180,7 @@ async def auto_index(event):
             }
         )
 
-        print("SALVO AUTOMATICAMENTE")
+        print("SALVO AUTOMATICAMENTE NO BANCO")
 
     except Exception:
         print(traceback.format_exc())
@@ -211,6 +230,8 @@ async def root():
 @app.get("/reindex")
 async def reindex_channel():
     count = 0
+    errors = []
+
     async for msg in client.iter_messages(CHANNEL_ID):
         try:
             if not msg.media:
@@ -227,31 +248,17 @@ async def reindex_channel():
             if existing:
                 continue
 
-            clean_name = filename.replace(".", " ").replace("_", " ")
-            clean_name = re.sub(
-                r'1080p|720p|2160p|x264|x265|BluRay|WEBRip|WEB-DL|H264|H265|AAC|DUAL|DUBLADO',
-                '',
-                clean_name,
-                flags=re.IGNORECASE
-            ).strip()
+            content_type, season, episode, query_name = parse_media_filename(filename)
 
-            imdb_id = None
-            title = filename
-            content_type = "movie"
-            season = None
-            episode = None
-
-            match = re.search(r'[Ss](\d{1,2})[Ee](\d{1,2})', filename)
-            if match:
-                content_type = "series"
-                season = int(match.group(1))
-                episode = int(match.group(2))
-                query_name = re.sub(r'[Ss]\d{1,2}[Ee]\d{1,2}', '', clean_name).strip()
+            if content_type == "series":
                 search_url = f"https://v3-cinemeta.strem.io/catalog/series/top/search={quote(query_name)}.json"
             else:
-                search_url = f"https://v3-cinemeta.strem.io/catalog/movie/top/search={quote(clean_name)}.json"
+                search_url = f"https://v3-cinemeta.strem.io/catalog/movie/top/search={quote(query_name)}.json"
 
             r = requests.get(search_url, timeout=10)
+            imdb_id = None
+            title = filename
+
             if r.status_code == 200:
                 metas = r.json().get("metas", [])
                 if metas:
@@ -274,10 +281,20 @@ async def reindex_channel():
                     }
                 )
                 count += 1
-        except Exception:
+                print(f"INDEXADO: {filename} -> {title} (T{season}E{episode})")
+            else:
+                print(f"IGNORADO (Cinemeta sem resultado): {filename}")
+                errors.append(filename)
+
+        except Exception as e:
+            print(f"ERRO AO PROCESSAR {msg.id}: {str(e)}")
             continue
 
-    return {"status": "concluido", "itens_indexados": count}
+    return {
+        "status": "concluido",
+        "novos_itens_indexados": count,
+        "arquivos_nao_encontrados": errors
+    }
 
 # =========================================================
 # MANIFEST
@@ -332,8 +349,6 @@ async def catalog(type: str, catalog_id: str):
             SELECT DISTINCT ON (imdb_id)
                 imdb_id,
                 title,
-                season,
-                episode,
                 id
             FROM entries
             WHERE type='series'
@@ -345,13 +360,8 @@ async def catalog(type: str, catalog_id: str):
     metas = []
 
     for row in rows:
-        if type == "series":
-            meta_id = f"{row['imdb_id']}:{row['season']}:{row['episode']}"
-        else:
-            meta_id = row["imdb_id"]
-
         metas.append({
-            "id": meta_id,
+            "id": row["imdb_id"],
             "type": type,
             "name": row["title"],
             "poster": "https://via.placeholder.com/300x450.png?text=TelaVerde"
