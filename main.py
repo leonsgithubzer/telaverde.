@@ -20,7 +20,7 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 # =========================================================
-# CONFIG
+# CONFIGURAÇÕES DE AMBIENTE
 # =========================================================
 
 API_ID = int(os.getenv("API_ID", 0))
@@ -35,7 +35,7 @@ FIMOO_API_URL = "https://fenixflix-search.vercel.app/search"
 CHUNK_SIZE = 1024 * 1024 * 2
 
 # =========================================================
-# TELEGRAM CLIENT
+# CLIENTE DO TELEGRAM
 # =========================================================
 
 client = TelegramClient(
@@ -50,7 +50,7 @@ client = TelegramClient(
 )
 
 # =========================================================
-# DATABASE
+# CONEXÃO COM O BANCO DE DADOS (SUPABASE / PGBOUNCER)
 # =========================================================
 
 database = Database(
@@ -58,11 +58,11 @@ database = Database(
     min_size=1,
     max_size=5,
     timeout=60,
-    statement_cache_size=0
+    statement_cache_size=0  # Evita erro DuplicatePreparedStatementError no PgBouncer
 )
 
 # =========================================================
-# INIT DB
+# INICIALIZAÇÃO DA TABELA
 # =========================================================
 
 async def init_db():
@@ -81,7 +81,7 @@ async def init_db():
     await database.execute(query=query)
 
 # =========================================================
-# HELPER DE EXTRAÇÃO DE MÍDIA (SUPORTE AMPLIADO A REGEX)
+# PARSER FLEXÍVEL DE NOMES DE ARQUIVO
 # =========================================================
 
 def parse_media_filename(filename: str):
@@ -98,13 +98,11 @@ def parse_media_filename(filename: str):
     episode = None
     query_name = clean_name
 
-    # Padrão 1: S01E01 / s1e1 / S01.E01
+    # Regex 1: S01E01 / s1e1 / S01.E01
     match_se = re.search(r'[Ss](\d{1,2})[\s._-]*[Ee](\d{1,2})', filename)
-    
-    # Padrão 2: 1x01 / 01x01
+    # Regex 2: 1x01 / 01x01
     match_x = re.search(r'(\d{1,2})[Xx](\d{1,2})', filename)
-    
-    # Padrão 3: E01 / Episodio 01 (Assume temporada 1)
+    # Regex 3: E01 / Episodio 01 (Assume Temporada 1 por padrão)
     match_ep = re.search(r'(?:[Ee]|Episodio|Ep)[\s._-]*(\d{1,2})', filename, re.IGNORECASE)
 
     if match_se:
@@ -126,7 +124,7 @@ def parse_media_filename(filename: str):
     return content_type, season, episode, query_name
 
 # =========================================================
-# AUTO INDEXER
+# INDEXAÇÃO AUTOMÁTICA (NOVAS MENSAGENS)
 # =========================================================
 
 @client.on(events.NewMessage(chats=CHANNEL_ID))
@@ -139,7 +137,7 @@ async def auto_index(event):
         if not filename:
             return
 
-        print(f"\nNOVO ARQUIVO: {filename}")
+        print(f"\n[AUTO INDEX] Novo arquivo detectado: {filename}")
 
         content_type, season, episode, query_name = parse_media_filename(filename)
 
@@ -157,10 +155,10 @@ async def auto_index(event):
             if metas:
                 imdb_id = metas[0]["id"]
                 title = metas[0]["name"]
-                print(f"ENCONTRADO: {title} (T{season}E{episode})")
+                print(f"[AUTO INDEX] Encontrado no Cinemeta: {title}")
 
         if not imdb_id:
-            print(f"NÃO ENCONTRADO NO CINEMETA: {filename}")
+            print(f"[AUTO INDEX] Não encontrado no Cinemeta: {filename}")
             return
 
         await database.execute(
@@ -180,13 +178,13 @@ async def auto_index(event):
             }
         )
 
-        print("SALVO AUTOMATICAMENTE NO BANCO")
+        print("[AUTO INDEX] Registrado com sucesso no Supabase")
 
     except Exception:
         print(traceback.format_exc())
 
 # =========================================================
-# FASTAPI LIFESPAN
+# CICLO DE VIDA FASTAPI
 # =========================================================
 
 @asynccontextmanager
@@ -194,13 +192,13 @@ async def lifespan(app: FastAPI):
     await database.connect()
     await init_db()
     await client.start()
-    print("BOT ONLINE")
+    print(">>> SERVIÇO TELAVERDE E TELEGRAM CONECTADOS <<<")
     yield
     await database.disconnect()
     await client.disconnect()
 
 # =========================================================
-# FASTAPI
+# INSTÂNCIA FASTAPI
 # =========================================================
 
 app = FastAPI(lifespan=lifespan)
@@ -213,7 +211,7 @@ app.add_middleware(
 )
 
 # =========================================================
-# ROOT
+# ENDPOINTS
 # =========================================================
 
 @app.get("/")
@@ -222,10 +220,6 @@ async def root():
         "status": "online",
         "telegram_connected": client.is_connected()
     }
-
-# =========================================================
-# REINDEXAR HISTÓRICO ANTIGO DO TELEGRAM
-# =========================================================
 
 @app.get("/reindex")
 async def reindex_channel():
@@ -281,13 +275,11 @@ async def reindex_channel():
                     }
                 )
                 count += 1
-                print(f"INDEXADO: {filename} -> {title} (T{season}E{episode})")
             else:
-                print(f"IGNORADO (Cinemeta sem resultado): {filename}")
                 errors.append(filename)
 
         except Exception as e:
-            print(f"ERRO AO PROCESSAR {msg.id}: {str(e)}")
+            print(f"Erro ao processar mensagem {msg.id}: {str(e)}")
             continue
 
     return {
@@ -295,10 +287,6 @@ async def reindex_channel():
         "novos_itens_indexados": count,
         "arquivos_nao_encontrados": errors
     }
-
-# =========================================================
-# MANIFEST
-# =========================================================
 
 @app.get("/manifest.json")
 def manifest():
@@ -324,19 +312,13 @@ def manifest():
         ]
     }
 
-# =========================================================
-# CATALOG
-# =========================================================
-
 @app.get("/catalog/{type}/{catalog_id}.json")
 async def catalog(type: str, catalog_id: str):
     if type == "movie":
         rows = await database.fetch_all(
             """
             SELECT DISTINCT ON (imdb_id)
-                imdb_id,
-                title,
-                id
+                imdb_id, title
             FROM entries
             WHERE type='movie'
             ORDER BY imdb_id, id DESC
@@ -347,9 +329,7 @@ async def catalog(type: str, catalog_id: str):
         rows = await database.fetch_all(
             """
             SELECT DISTINCT ON (imdb_id)
-                imdb_id,
-                title,
-                id
+                imdb_id, title
             FROM entries
             WHERE type='series'
             ORDER BY imdb_id, id DESC
@@ -358,7 +338,6 @@ async def catalog(type: str, catalog_id: str):
         )
 
     metas = []
-
     for row in rows:
         metas.append({
             "id": row["imdb_id"],
@@ -369,27 +348,16 @@ async def catalog(type: str, catalog_id: str):
 
     return {"metas": metas}
 
-# =========================================================
-# META
-# =========================================================
-
 @app.get("/meta/{type}/{imdb_id}.json")
 async def meta(type: str, imdb_id: str):
     imdb_clean = imdb_id.split(":")[0]
 
     row = await database.fetch_one(
-        """
-        SELECT title
-        FROM entries
-        WHERE imdb_id=:imdb_id
-        LIMIT 1
-        """,
+        "SELECT title FROM entries WHERE imdb_id=:imdb_id LIMIT 1",
         {"imdb_id": imdb_clean}
     )
 
-    title = imdb_clean
-    if row:
-        title = row["title"]
+    title = row["title"] if row else imdb_clean
 
     return {
         "meta": {
@@ -399,10 +367,6 @@ async def meta(type: str, imdb_id: str):
             "poster": "https://via.placeholder.com/300x450.png?text=TelaVerde"
         }
     }
-
-# =========================================================
-# STREAM
-# =========================================================
 
 @app.get("/stream/{type}/{stremio_id}.json")
 async def stream_handler(type: str, stremio_id: str):
@@ -421,13 +385,7 @@ async def stream_handler(type: str, stremio_id: str):
 
     if type == "movie":
         row = await database.fetch_one(
-            """
-            SELECT message_id, title
-            FROM entries
-            WHERE imdb_id=:imdb_id
-            AND type='movie'
-            LIMIT 1
-            """,
+            "SELECT message_id, title FROM entries WHERE imdb_id=:imdb_id AND type='movie' LIMIT 1",
             {"imdb_id": imdb_id}
         )
     else:
@@ -435,17 +393,10 @@ async def stream_handler(type: str, stremio_id: str):
             """
             SELECT message_id, title
             FROM entries
-            WHERE imdb_id=:imdb_id
-            AND type='series'
-            AND season=:season
-            AND episode=:episode
+            WHERE imdb_id=:imdb_id AND type='series' AND season=:season AND episode=:episode
             LIMIT 1
             """,
-            {
-                "imdb_id": imdb_id,
-                "season": season,
-                "episode": episode
-            }
+            {"imdb_id": imdb_id, "season": season, "episode": episode}
         )
 
     if row:
@@ -459,13 +410,10 @@ async def stream_handler(type: str, stremio_id: str):
             ]
         }
 
+    # Fallback para a API secundária (Fimoo)
     try:
-        query = imdb_id
-        if type == "series" and season is not None:
-            query = f"{imdb_id}:{season}:{episode}"
-
+        query = f"{imdb_id}:{season}:{episode}" if (type == "series" and season is not None) else imdb_id
         r = requests.get(f"{FIMOO_API_URL}/{query}", timeout=5)
-
         if r.status_code == 200:
             data = r.json()
             return {
@@ -478,19 +426,14 @@ async def stream_handler(type: str, stremio_id: str):
                 ]
             }
     except Exception:
-        print(traceback.format_exc())
+        pass
 
     return {"streams": []}
-
-# =========================================================
-# VIDEO PROXY
-# =========================================================
 
 @app.get("/video/{message_id}")
 async def video_proxy(message_id: int, range: str = Header(None)):
     try:
         msg = await client.get_messages(CHANNEL_ID, ids=message_id)
-
         if not msg:
             return Response(status_code=404)
 
