@@ -57,7 +57,7 @@ database = Database(
     min_size=1,
     max_size=5,
     timeout=60,
-    statement_cache_size=0  # Previne erro DuplicatePreparedStatementError no PgBouncer
+    statement_cache_size=0
 )
 
 # =========================================================
@@ -84,20 +84,20 @@ async def init_db():
 # =========================================================
 
 def parse_media_filename(filename: str):
-    # 1. Detecta se há um IMDb ID explícito (ex: tt16026746) no nome/legenda
+    # 1. Detecta se há um IMDb ID explícito (ex: tt16026746)
     explicit_imdb = None
     imdb_match = re.search(r'\b(tt\d{7,8})\b', filename)
     if imdb_match:
         explicit_imdb = imdb_match.group(1)
 
-    # 2. Remove extensão do arquivo (.mp4, .mkv, etc.)
+    # 2. Remove extensão
     name_clean = re.sub(r'\.(mp4|mkv|avi|mov|flv|wmv)$', '', filename, flags=re.IGNORECASE)
 
-    # 3. Remove tags de canais do Telegram, arrobas e links (@FenixFilmes, t.me/..., etc.)
+    # 3. Remove tags, arrobas e links (@FenixFilmes, t.me, etc)
     name_clean = re.sub(r'@[A-Za-z0-9_]+', '', name_clean)
     name_clean = re.sub(r'https?://\S+|www\.\S+', '', name_clean)
 
-    # 4. Normaliza separadores comuns (pontos, underlines, traços)
+    # 4. Normaliza separadores
     name_clean = name_clean.replace(".", " ").replace("_", " ").replace("-", " ")
 
     # 5. Extração de Temporada e Episódio
@@ -122,30 +122,25 @@ def parse_media_filename(filename: str):
         season = 1
         episode = int(ep_pattern.group(1))
 
-    # 6. Remove ruídos de qualidade e metadados para isolar apenas o título
+    # 6. Limpeza de termos de busca
     query_title = re.sub(
-        r'(?i)\b(1080p|720p|480p|2160p|4k|x264|x265|hevc|bluray|webrip|web-dl|h264|h265|aac|dual|dublado|legendado|national|multi|complete|temporada|season)\b',
+        r'(?i)\b(1080p|720p|480p|2160p|4k|x264|x265|hevc|bluray|webrip|web-dl|h264|h265|aac|dual|dublado|legendado)\b',
         '',
         name_clean
     )
-
-    # Remove padrões de episódios e o IMDb ID do termo final de busca
     query_title = re.sub(r'(?i)[Ss]\d{1,2}[\s._-]*[Ee]\d{1,2}', '', query_title)
     query_title = re.sub(r'\b\d{1,2}[Xx]\d{1,2}\b', '', query_title)
     query_title = re.sub(r'(?i)\b(?:[Ee]|Episodio|Ep)[\s._-]*\d{1,2}\b', '', query_title)
     query_title = re.sub(r'\b(tt\d{7,8})\b', '', query_title)
-
-    # Remove espaços duplos
     query_title = re.sub(r'\s+', ' ', query_title).strip()
 
     return content_type, season, episode, query_title, explicit_imdb
 
 # =========================================================
-# BUSCA INTELIGENTE NO CINEMETA (MULTI-QUERY FALLBACK)
+# BUSCA INTELIGENTE NO CINEMETA
 # =========================================================
 
 def search_cinemeta(query_name: str, content_type: str, explicit_imdb: str = None):
-    # Se um IMDb ID explícito foi fornecido, usa ele diretamente
     if explicit_imdb:
         url = f"https://v3-cinemeta.strem.io/meta/{content_type}/{explicit_imdb}.json"
         try:
@@ -187,7 +182,7 @@ def search_cinemeta(query_name: str, content_type: str, explicit_imdb: str = Non
     return None, None
 
 # =========================================================
-# RE-INDEXAÇÃO COM LÓGICA SMART-UPSERT
+# PROCESSADOR DE MENSAGEM
 # =========================================================
 
 async def process_and_save_message(msg):
@@ -204,13 +199,11 @@ async def process_and_save_message(msg):
     if not imdb_id:
         return False, filename
 
-    # Garante a atualização: remove registros antigos associados a essa mesma mensagem
     await database.execute(
         "DELETE FROM entries WHERE message_id = :mid",
         {"mid": msg.id}
     )
 
-    # Insere o novo registro atualizado com os metadados corretos
     await database.execute(
         """
         INSERT INTO entries (imdb_id, title, type, season, episode, message_id)
@@ -228,7 +221,7 @@ async def process_and_save_message(msg):
     return True, title
 
 # =========================================================
-# AUTO INDEXAÇÃO (NOVAS MENSAGENS)
+# AUTO INDEXAÇÃO
 # =========================================================
 
 @client.on(events.NewMessage(chats=CHANNEL_ID))
@@ -236,9 +229,9 @@ async def auto_index(event):
     try:
         success, info = await process_and_save_message(event)
         if success:
-            print(f"[AUTO INDEX] Registrado com sucesso: {info}")
+            print(f"[AUTO INDEX] Sucesso: {info}")
         else:
-            print(f"[AUTO INDEX] Falha ao identificar: {info}")
+            print(f"[AUTO INDEX] Falha: {info}")
     except Exception:
         print(traceback.format_exc())
 
@@ -280,10 +273,27 @@ async def root():
         "telegram_connected": client.is_connected()
     }
 
+# Rotas de Inspeção com aliasing para evitar erro 404
 @app.get("/list")
+@app.get("/list/")
+@app.get("/list.json")
 async def list_entries():
     rows = await database.fetch_all(
         "SELECT id, imdb_id, title, type, season, episode, message_id FROM entries ORDER BY id DESC LIMIT 50"
+    )
+    return [dict(row) for row in rows]
+
+# Rota de Diagnóstico Direto por ID ou Nome
+@app.get("/check/{query}")
+async def check_entry(query: str):
+    rows = await database.fetch_all(
+        """
+        SELECT id, imdb_id, title, type, season, episode, message_id 
+        FROM entries 
+        WHERE imdb_id LIKE :q OR LOWER(title) LIKE LOWER(:q_like)
+        ORDER BY id DESC LIMIT 20
+        """,
+        {"q": f"%{query}%", "q_like": f"%{query}%"}
     )
     return [dict(row) for row in rows]
 
@@ -313,9 +323,9 @@ async def reindex_channel():
 def manifest():
     return {
         "id": "org.telaverde.hybrid",
-        "version": "7.2.0",
+        "version": "7.3.0",
         "name": "TelaVerde Ultra",
-        "description": "Telegram Streaming + Smart Re-indexer & Inspector",
+        "description": "Telegram Streaming + Inspector & Multi-route",
         "resources": ["stream", "catalog", "meta"],
         "types": ["movie", "series"],
         "idPrefixes": ["tt"],
@@ -410,7 +420,7 @@ async def stream_handler(type: str, stremio_id: str):
             {"imdb_id": imdb_id}
         )
     else:
-        # Busca exata por temporada e episódio
+        # 1. Busca exata por temporada e episódio
         row = await database.fetch_one(
             """
             SELECT message_id, title
@@ -421,16 +431,16 @@ async def stream_handler(type: str, stremio_id: str):
             {"imdb_id": imdb_id, "season": season, "episode": episode}
         )
 
-        # Fallback para episódios da 1ª temporada gravados com temporada nula
-        if not row and season == 1:
+        # 2. Fallback: busca apenas por episódio se a temporada estiver nula/1
+        if not row and season is not None and episode is not None:
             row = await database.fetch_one(
                 """
                 SELECT message_id, title
                 FROM entries
-                WHERE imdb_id=:imdb_id AND type='series' AND (season IS NULL OR season = 1) AND episode=:episode
+                WHERE imdb_id=:imdb_id AND type='series' AND (season IS NULL OR season = :season) AND episode=:episode
                 ORDER BY id DESC LIMIT 1
                 """,
-                {"imdb_id": imdb_id, "episode": episode}
+                {"imdb_id": imdb_id, "season": season, "episode": episode}
             )
 
     if row:
