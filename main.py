@@ -57,7 +57,7 @@ database = Database(
     min_size=1,
     max_size=5,
     timeout=60,
-    statement_cache_size=0
+    statement_cache_size=0  # Previne erro DuplicatePreparedStatementError no PgBouncer
 )
 
 # =========================================================
@@ -84,16 +84,16 @@ async def init_db():
 # =========================================================
 
 def parse_media_filename(filename: str):
-    # 1. Detecta se há um IMDb ID explícito (ex: tt16026746)
+    # 1. Detecta se há um IMDb ID explícito (ex: tt16026746) no texto
     explicit_imdb = None
     imdb_match = re.search(r'\b(tt\d{7,8})\b', filename)
     if imdb_match:
         explicit_imdb = imdb_match.group(1)
 
-    # 2. Remove extensão
+    # 2. Remove extensão do arquivo (.mp4, .mkv, etc.)
     name_clean = re.sub(r'\.(mp4|mkv|avi|mov|flv|wmv)$', '', filename, flags=re.IGNORECASE)
 
-    # 3. Remove tags, arrobas e links (@FenixFilmes, t.me, etc)
+    # 3. Remove tags, arrobas e links (@FenixFilmes, t.me/..., etc.)
     name_clean = re.sub(r'@[A-Za-z0-9_]+', '', name_clean)
     name_clean = re.sub(r'https?://\S+|www\.\S+', '', name_clean)
 
@@ -122,7 +122,7 @@ def parse_media_filename(filename: str):
         season = 1
         episode = int(ep_pattern.group(1))
 
-    # 6. Limpeza de termos de busca
+    # 6. Limpeza de termos de busca no Cinemeta
     query_title = re.sub(
         r'(?i)\b(1080p|720p|480p|2160p|4k|x264|x265|hevc|bluray|webrip|web-dl|h264|h265|aac|dual|dublado|legendado)\b',
         '',
@@ -182,7 +182,7 @@ def search_cinemeta(query_name: str, content_type: str, explicit_imdb: str = Non
     return None, None
 
 # =========================================================
-# PROCESSADOR DE MENSAGEM
+# PROCESSADOR DE MENSAGEM (SMART UPSERT)
 # =========================================================
 
 async def process_and_save_message(msg):
@@ -199,6 +199,7 @@ async def process_and_save_message(msg):
     if not imdb_id:
         return False, filename
 
+    # Remove registros antigos associados à mesma mensagem para atualizar metadados
     await database.execute(
         "DELETE FROM entries WHERE message_id = :mid",
         {"mid": msg.id}
@@ -221,7 +222,7 @@ async def process_and_save_message(msg):
     return True, title
 
 # =========================================================
-# AUTO INDEXAÇÃO
+# AUTO INDEXAÇÃO (NOVAS MENSAGENS)
 # =========================================================
 
 @client.on(events.NewMessage(chats=CHANNEL_ID))
@@ -273,7 +274,7 @@ async def root():
         "telegram_connected": client.is_connected()
     }
 
-# Rotas de Inspeção com aliasing para evitar erro 404
+# Inspetor do Banco
 @app.get("/list")
 @app.get("/list/")
 @app.get("/list.json")
@@ -283,7 +284,7 @@ async def list_entries():
     )
     return [dict(row) for row in rows]
 
-# Rota de Diagnóstico Direto por ID ou Nome
+# Busca por ID do IMDb ou Título
 @app.get("/check/{query}")
 async def check_entry(query: str):
     rows = await database.fetch_all(
@@ -296,6 +297,24 @@ async def check_entry(query: str):
         {"q": f"%{query}%", "q_like": f"%{query}%"}
     )
     return [dict(row) for row in rows]
+
+# Rota de Correção Manual via Navegador
+@app.get("/fix/{message_id}/{season}/{episode}")
+async def fix_entry(message_id: int, season: int, episode: int):
+    await database.execute(
+        """
+        UPDATE entries 
+        SET season = :season, episode = :episode 
+        WHERE message_id = :mid
+        """,
+        {"mid": message_id, "season": season, "episode": episode}
+    )
+    return {
+        "status": "atualizado",
+        "message_id": message_id,
+        "nova_temporada": season,
+        "novo_episodio": episode
+    }
 
 @app.get("/reindex")
 async def reindex_channel():
@@ -323,9 +342,9 @@ async def reindex_channel():
 def manifest():
     return {
         "id": "org.telaverde.hybrid",
-        "version": "7.3.0",
+        "version": "7.4.0",
         "name": "TelaVerde Ultra",
-        "description": "Telegram Streaming + Inspector & Multi-route",
+        "description": "Telegram Streaming + Smart Fallback & Fixer",
         "resources": ["stream", "catalog", "meta"],
         "types": ["movie", "series"],
         "idPrefixes": ["tt"],
@@ -420,7 +439,7 @@ async def stream_handler(type: str, stremio_id: str):
             {"imdb_id": imdb_id}
         )
     else:
-        # 1. Busca exata por temporada e episódio
+        # 1. Busca Exata: IMDb ID + Temporada + Episódio
         row = await database.fetch_one(
             """
             SELECT message_id, title
@@ -431,16 +450,16 @@ async def stream_handler(type: str, stremio_id: str):
             {"imdb_id": imdb_id, "season": season, "episode": episode}
         )
 
-        # 2. Fallback: busca apenas por episódio se a temporada estiver nula/1
-        if not row and season is not None and episode is not None:
+        # 2. Fallback Inteligente: Se a temporada falhar, busca apenas pelo NÚMERO DO EPISÓDIO nessa série
+        if not row and episode is not None:
             row = await database.fetch_one(
                 """
                 SELECT message_id, title
                 FROM entries
-                WHERE imdb_id=:imdb_id AND type='series' AND (season IS NULL OR season = :season) AND episode=:episode
+                WHERE imdb_id=:imdb_id AND type='series' AND episode=:episode
                 ORDER BY id DESC LIMIT 1
                 """,
-                {"imdb_id": imdb_id, "season": season, "episode": episode}
+                {"imdb_id": imdb_id, "episode": episode}
             )
 
     if row:
