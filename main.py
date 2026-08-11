@@ -57,7 +57,7 @@ database = Database(
     min_size=1,
     max_size=5,
     timeout=60,
-    statement_cache_size=0
+    statement_cache_size=0  # Previne erro DuplicatePreparedStatementError no PgBouncer
 )
 
 # =========================================================
@@ -84,17 +84,23 @@ async def init_db():
 # =========================================================
 
 def parse_media_filename(filename: str):
-    # 1. Remove extensão do arquivo (.mp4, .mkv, etc.)
+    # 1. Detecta se há um IMDb ID explícito (ex: tt16026746) no nome/legenda
+    explicit_imdb = None
+    imdb_match = re.search(r'\b(tt\d{7,8})\b', filename)
+    if imdb_match:
+        explicit_imdb = imdb_match.group(1)
+
+    # 2. Remove extensão do arquivo (.mp4, .mkv, etc.)
     name_clean = re.sub(r'\.(mp4|mkv|avi|mov|flv|wmv)$', '', filename, flags=re.IGNORECASE)
 
-    # 2. Remove tags de canais do Telegram, arrobas e links (@FenixFilmes, t.me/..., etc.)
+    # 3. Remove tags de canais do Telegram, arrobas e links (@FenixFilmes, t.me/..., etc.)
     name_clean = re.sub(r'@[A-Za-z0-9_]+', '', name_clean)
     name_clean = re.sub(r'https?://\S+|www\.\S+', '', name_clean)
 
-    # 3. Normaliza separadores comuns (pontos, underlines, traços)
+    # 4. Normaliza separadores comuns (pontos, underlines, traços)
     name_clean = name_clean.replace(".", " ").replace("_", " ").replace("-", " ")
 
-    # 4. Extração de Temporada e Episódio
+    # 5. Extração de Temporada e Episódio
     content_type = "movie"
     season = None
     episode = None
@@ -116,28 +122,42 @@ def parse_media_filename(filename: str):
         season = 1
         episode = int(ep_pattern.group(1))
 
-    # 5. Remove ruídos de qualidade e metadados para isolar apenas o título
+    # 6. Remove ruídos de qualidade e metadados para isolar apenas o título
     query_title = re.sub(
         r'(?i)\b(1080p|720p|480p|2160p|4k|x264|x265|hevc|bluray|webrip|web-dl|h264|h265|aac|dual|dublado|legendado|national|multi|complete|temporada|season)\b',
         '',
         name_clean
     )
 
-    # Remove padrões de episódios do termo final de busca no Cinemeta
+    # Remove padrões de episódios e o IMDb ID do termo final de busca
     query_title = re.sub(r'(?i)[Ss]\d{1,2}[\s._-]*[Ee]\d{1,2}', '', query_title)
     query_title = re.sub(r'\b\d{1,2}[Xx]\d{1,2}\b', '', query_title)
     query_title = re.sub(r'(?i)\b(?:[Ee]|Episodio|Ep)[\s._-]*\d{1,2}\b', '', query_title)
+    query_title = re.sub(r'\b(tt\d{7,8})\b', '', query_title)
 
     # Remove espaços duplos
     query_title = re.sub(r'\s+', ' ', query_title).strip()
 
-    return content_type, season, episode, query_title
+    return content_type, season, episode, query_title, explicit_imdb
 
 # =========================================================
 # BUSCA INTELIGENTE NO CINEMETA (MULTI-QUERY FALLBACK)
 # =========================================================
 
-def search_cinemeta(query_name: str, content_type: str):
+def search_cinemeta(query_name: str, content_type: str, explicit_imdb: str = None):
+    # Se um IMDb ID explícito foi fornecido, usa ele diretamente
+    if explicit_imdb:
+        url = f"https://v3-cinemeta.strem.io/meta/{content_type}/{explicit_imdb}.json"
+        try:
+            r = requests.get(url, timeout=8)
+            if r.status_code == 200:
+                meta = r.json().get("meta", {})
+                if meta.get("name"):
+                    return explicit_imdb, meta["name"]
+        except Exception:
+            pass
+        return explicit_imdb, query_name or explicit_imdb
+
     if not query_name:
         return None, None
 
@@ -145,7 +165,6 @@ def search_cinemeta(query_name: str, content_type: str):
     alt_type = "movie" if content_type == "series" else "series"
     search_types.append(alt_type)
 
-    # Tenta com o nome completo e com o nome sem o ano (ex: "Todo Poderoso 2003" -> "Todo Poderoso")
     queries = [query_name]
     no_year_query = re.sub(r'\b(19|20)\d{2}\b', '', query_name).strip()
     if no_year_query != query_name:
@@ -179,8 +198,8 @@ async def process_and_save_message(msg):
     if not filename:
         return False, None
 
-    content_type, season, episode, query_name = parse_media_filename(filename)
-    imdb_id, title = search_cinemeta(query_name, content_type)
+    content_type, season, episode, query_name, explicit_imdb = parse_media_filename(filename)
+    imdb_id, title = search_cinemeta(query_name, content_type, explicit_imdb)
 
     if not imdb_id:
         return False, filename
@@ -261,6 +280,13 @@ async def root():
         "telegram_connected": client.is_connected()
     }
 
+@app.get("/list")
+async def list_entries():
+    rows = await database.fetch_all(
+        "SELECT id, imdb_id, title, type, season, episode, message_id FROM entries ORDER BY id DESC LIMIT 50"
+    )
+    return [dict(row) for row in rows]
+
 @app.get("/reindex")
 async def reindex_channel():
     count = 0
@@ -287,9 +313,9 @@ async def reindex_channel():
 def manifest():
     return {
         "id": "org.telaverde.hybrid",
-        "version": "7.1.0",
+        "version": "7.2.0",
         "name": "TelaVerde Ultra",
-        "description": "Telegram Streaming + Smart Re-indexer",
+        "description": "Telegram Streaming + Smart Re-indexer & Inspector",
         "resources": ["stream", "catalog", "meta"],
         "types": ["movie", "series"],
         "idPrefixes": ["tt"],
