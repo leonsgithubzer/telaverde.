@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 telethon
-requests
+httpx
 databases[postgresql]
 asyncpg
 sqlalchemy
