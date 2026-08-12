@@ -36,6 +36,27 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 FIMOO_API_URL = "https://fenixflix-search.vercel.app/search"
 CHUNK_SIZE = 1024 * 1024 * 2
 
+# MAPA LOCAL DE PROTEÇÃO CONTRA CONFUSÕES CLÁSSICAS (LIVE-ACTION vs DESENHO)
+EXPLICIT_IMDB_MAP = {
+    # Garfield
+    "garfield": "tt0356634",
+    "garfield o filme": "tt0356634",
+    "garfield 2": "tt0463323",
+    "garfield 2 o filme": "tt0463323",
+    "garfield fora de casa": "tt13398158",
+    # O Rei Leão
+    "o rei leao 1994": "tt0110357",
+    "o rei leão 1994": "tt0110357",
+    "o rei leao 2019": "tt6105098",
+    "o rei leão 2019": "tt6105098",
+    # A Pequena Sereia
+    "a pequena sereia 1989": "tt0098096",
+    "a pequena sereia 2023": "tt5971474",
+    # Pica-Pau
+    "pica pau o filme": "tt2118686",
+    "pica-pau o filme": "tt2118686"
+}
+
 TITLE_TRANSLATIONS = {
     "carros": "Cars",
     "divertida mente": "Inside Out",
@@ -44,7 +65,8 @@ TITLE_TRANSLATIONS = {
     "os incríveis": "The Incredibles",
     "meu malvado favorito": "Despicable Me",
     "homem aranha": "Spider-Man",
-    "batman": "Batman"
+    "batman": "Batman",
+    "velozes e furiosos": "Fast & Furious"
 }
 
 # =========================================================
@@ -94,39 +116,61 @@ async def init_db():
     await database.execute(query=query)
 
 # =========================================================
-# PARSER LOCAL E EXTRAÇÃO DE QUALIDADE
+# EXTRAÇÃO DE RESOLUÇÃO E ÁUDIO (FORMATO LIMPO E EXPLÍCITO)
 # =========================================================
 
 def extract_quality_tags(text: str) -> str:
-    tags = []
+    if not text:
+        return "1080p"
+
     text_upper = text.upper()
-    
-    if "2160P" in text_upper or "4K" in text_upper:
+    tags = []
+
+    # 1. Resolução
+    if "2160P" in text_upper or "4K" in text_upper or "UHD" in text_upper:
         tags.append("4K")
-    elif "1080P" in text_upper:
+    elif "1080P" in text_upper or "FULLHD" in text_upper or "FULL HD" in text_upper:
         tags.append("1080p")
-    elif "720P" in text_upper:
+    elif "720P" in text_upper or " HD " in text_upper or text_upper.endswith("HD"):
         tags.append("720p")
-    elif "480P" in text_upper:
+    elif "480P" in text_upper or "SD" in text_upper:
         tags.append("480p")
+    else:
+        tags.append("1080p")  # Padrão HD
 
-    if "DUAL" in text_upper:
+    # 2. Tipo de Áudio
+    if "DUAL" in text_upper or "DUAL AUDIO" in text_upper or "DUAL ÁUDIO" in text_upper:
         tags.append("Dual Áudio")
-    elif "DUBLADO" in text_upper:
+    elif "DUBLADO" in text_upper or "DUB" in text_upper:
         tags.append("Dublado")
-    elif "LEGENDADO" in text_upper:
+    elif "LEGENDADO" in text_upper or "LEG" in text_upper:
         tags.append("Legendado")
+    elif "NACIONAL" in text_upper:
+        tags.append("Nacional")
 
-    return " | ".join(tags) if tags else "HD"
+    return " | ".join(tags)
+
+# =========================================================
+# PARSER LOCAL COM PROTEÇÃO DIRETA
+# =========================================================
 
 def parse_media_text(raw_text: str):
     if not raw_text:
         return "movie", None, None, "", None
 
+    low_text = raw_text.lower()
     explicit_imdb = None
-    imdb_match = re.search(r'\b(tt\d{7,8})\b', raw_text)
-    if imdb_match:
-        explicit_imdb = imdb_match.group(1)
+
+    # Checa no mapa de proteção contra confusão entre Live-Action e Desenhos
+    for key, imdb in EXPLICIT_IMDB_MAP.items():
+        if key in low_text:
+            explicit_imdb = imdb
+            break
+
+    if not explicit_imdb:
+        imdb_match = re.search(r'\b(tt\d{7,8})\b', raw_text)
+        if imdb_match:
+            explicit_imdb = imdb_match.group(1)
 
     content_type = "movie"
     season = None
@@ -134,7 +178,7 @@ def parse_media_text(raw_text: str):
 
     se_pattern = re.search(r'[Ss](\d{1,2})[\s._-]*[Ee](\d{1,2})', raw_text)
     x_pattern = re.search(r'(\d{1,2})[Xx](\d{1,2})', raw_text)
-    ep_pattern = re.search(r'(?:[Ee]|Episodio|Episódio|Ep)[\s._-]*(\d{1,2})', raw_text, re.IGNORECASE)
+    ep_pattern = re.search(r'(?:[Ee]|Episodio|Episódio|Ep|Capitulo|Capítulo)[\s._-]*(\d{1,2})', raw_text, re.IGNORECASE)
 
     if se_pattern:
         content_type = "series"
@@ -160,7 +204,7 @@ def parse_media_text(raw_text: str):
 
     clean_title = re.sub(r'(?i)[Ss]\d{1,2}[\s._-]*[Ee]\d{1,2}', '', clean_title)
     clean_title = re.sub(r'\b\d{1,2}[Xx]\d{1,2}\b', '', clean_title)
-    clean_title = re.sub(r'(?i)\b(?:[Ee]|Episodio|Episódio|Ep)[\s._-]*\d{1,2}\b', '', clean_title)
+    clean_title = re.sub(r'(?i)\b(?:[Ee]|Episodio|Episódio|Ep|Capitulo|Capítulo)[\s._-]*\d{1,2}\b', '', clean_title)
 
     clean_title = re.sub(
         r'(?i)\b(1080p|720p|480p|2160p|4k|x264|x265|hevc|bluray|webrip|web-dl|h264|h265|aac|dual|dublado|legendado|audio|áudio|portugues|português)\b',
@@ -173,7 +217,7 @@ def parse_media_text(raw_text: str):
     return content_type, season, episode, clean_title, explicit_imdb
 
 # =========================================================
-# INTELIGÊNCIA ARTIFICIAL (GEMINI - ASSÍNCRONA)
+# INTELIGÊNCIA ARTIFICIAL (GEMINI - PROMPT COM TREINAMENTO PREDITIVO)
 # =========================================================
 
 async def ai_analyze_message(text: str, filename: str):
@@ -181,19 +225,45 @@ async def ai_analyze_message(text: str, filename: str):
         return None
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-    
-    prompt = f"""
-    Extraia o título limpo, tipo, temporada e episódio do filme/série abaixo.
-    Texto: "{text}" | Arquivo: "{filename}"
 
-    Responda EXATAMENTE em JSON:
+    prompt = f"""
+    Você é a Inteligência Artificial especialista suprema em catalogação do IMDb e Cinemeta/Stremio para o serviço TelaVerde.
+    Sua missão é extrair com PRECISÃO ABSOLUTA os metadados de mídia a partir do texto/legenda e nome de arquivo do Telegram.
+
+    [ENTRADAS]
+    Legenda: "{text}"
+    Nome do Arquivo: "{filename}"
+
+    [MANUAL PREDITIVO DE CATALOGAÇÃO - REGRAS INFALÍVEIS]
+    1. DISTINÇÃO LIVE-ACTION vs. DESENHO/ANIMAÇÃO:
+       - "Garfield: O Filme" (2004 Live-Action com atores/CGI) = imdb_id "tt0356634"
+       - "Garfield 2" (2006 Live-Action) = imdb_id "tt0463323"
+       - "Garfield: Fora de Casa" (2024 Animação) = imdb_id "tt13398158"
+       - "O Rei Leão" (1994 Animação = tt0110357 | 2019 Live-Action = tt6105098)
+       - "A Pequena Sereia" (1989 Animação = tt0098096 | 2023 Live-Action = tt5971474)
+       - "Pica-Pau: O Filme" (2017 Live-Action = tt2118686)
+
+    2. REBOOTS, REMAKES E DIFERENCIAÇÃO POR ANO:
+       - Se houver indicação de ano na legenda (ex: 1984, 2021), use-o para apontar o "imdb_id" correto ou adicione o ano ao "original_title".
+
+    3. ANIME E SÉRIES FRACIONADAS:
+       - Se houver termos como "Ep 03", "Capítulo 03", "Parte 2", "S01E03", defina obrigatoriamente type="series". Se não houver temporada explícita, defina season=1.
+
+    4. TAGS EXPLÍCITAS IMDB:
+       - Se o texto contiver uma tag como [tt16026746] ou tt16026746, retorne este valor exatamente no campo "imdb_id".
+
+    5. HIGIENIZAÇÃO DE TÍTULO PARA CINEMETA:
+       - "title": Título limpo sem qualidade (1080p, 4k), sem tags de grupo (@...) e sem subtítulos em português que dificultem a busca.
+       - "original_title": Título original em inglês (ex: "Cars" para Carros, "Inside Out" para Divertida Mente, "The Dark Knight" para Batman).
+
+    Responda EXATAMENTE e APENAS em formato JSON válido:
     {{
         "imdb_id": "ttXXXXXXX" ou null,
         "title": "Título Limpo sem subtítulo",
-        "original_title": "Título em inglês",
+        "original_title": "Original Title in English",
         "type": "movie" ou "series",
-        "season": número ou null,
-        "episode": número ou null
+        "season": número inteiro ou null,
+        "episode": número inteiro ou null
     }}
     """
 
@@ -212,11 +282,11 @@ async def ai_analyze_message(text: str, filename: str):
                 return json.loads(raw_json)
     except Exception:
         pass
-    
+
     return None
 
 # =========================================================
-# BUSCA INTELIGENTE NO CINEMETA (ASSÍNCRONA)
+# BUSCA INTELIGENTE NO CINEMETA
 # =========================================================
 
 async def search_cinemeta(query_name: str, content_type: str, explicit_imdb: str = None, original_title: str = None):
@@ -309,7 +379,7 @@ async def process_and_save_message(msg):
             query_name = ai_data.get("title", query_name)
             explicit_imdb = ai_data.get("imdb_id", explicit_imdb)
             orig_title = ai_data.get("original_title")
-            
+
             imdb_id, title = await search_cinemeta(query_name, content_type, explicit_imdb, orig_title)
 
     if not imdb_id:
@@ -457,9 +527,9 @@ async def reindex_channel():
 def manifest():
     return {
         "id": "org.telaverde.hybrid",
-        "version": "9.0.1",
+        "version": "10.0.0",
         "name": "TelaVerde Ultra Pro",
-        "description": "Telegram Streaming + Async HTTPX Engine & Metahub Posters",
+        "description": "Telegram Streaming + Trained AI Engine & Precision Quality Tags",
         "resources": ["stream", "catalog", "meta"],
         "types": ["movie", "series"],
         "idPrefixes": ["tt"],
@@ -546,7 +616,6 @@ async def stream_handler(type: str, stremio_id: str):
             {"imdb_id": imdb_id}
         )
     else:
-        # Busca exata
         rows = await database.fetch_all(
             """
             SELECT message_id, title
@@ -557,7 +626,6 @@ async def stream_handler(type: str, stremio_id: str):
             {"imdb_id": imdb_id, "season": season, "episode": episode}
         )
 
-        # Fallback de episódio
         if not rows and episode is not None:
             rows = await database.fetch_all(
                 """
@@ -577,7 +645,7 @@ async def stream_handler(type: str, stremio_id: str):
             raw_info = f"{msg.text or ''} {getattr(msg.file, 'name', '') or ''}"
             quality_tag = extract_quality_tags(raw_info)
         except Exception:
-            quality_tag = "HD"
+            quality_tag = "1080p"
 
         stream_title = f"🟢 Option {idx+1} [{quality_tag}]" if len(rows) > 1 else f"🟢 TelaVerde [{quality_tag}]"
 
@@ -590,7 +658,7 @@ async def stream_handler(type: str, stremio_id: str):
     if streams:
         return {"streams": streams}
 
-    # Fallback para API secundária (Fimoo)
+    # Fallback Fimoo
     try:
         query = f"{imdb_id}:{season}:{episode}" if (type == "series" and season is not None) else imdb_id
         async with httpx.AsyncClient(timeout=5) as http_client:
@@ -612,7 +680,6 @@ async def stream_handler(type: str, stremio_id: str):
 
     return {"streams": []}
 
-# ROTA DE VÍDEO COMPATÍVEL COM FASTAPI (GET E HEAD)
 @app.api_route("/video/{message_id}", methods=["GET", "HEAD"])
 async def video_proxy(request: Request, message_id: int):
     try:
@@ -643,7 +710,6 @@ async def video_proxy(request: Request, message_id: int):
             "Cache-Control": "public, max-age=3600"
         }
 
-        # Trata requisições HEAD (Smart TVs e Stremio Web)
         if request.method == "HEAD":
             return Response(status_code=206, headers=headers)
 
