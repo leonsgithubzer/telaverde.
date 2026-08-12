@@ -35,6 +35,18 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 FIMOO_API_URL = "https://fenixflix-search.vercel.app/search"
 CHUNK_SIZE = 1024 * 1024 * 2
 
+# DICIONÁRIO DE TRADUÇÕES PT-BR PARA CINEMETA
+TITLE_TRANSLATIONS = {
+    "carros": "Cars",
+    "divertida mente": "Inside Out",
+    "enrolados": "Tangled",
+    "os increveis": "The Incredibles",
+    "os incríveis": "The Incredibles",
+    "meu malvado favorito": "Despicable Me",
+    "homem aranha": "Spider-Man",
+    "batman": "Batman"
+}
+
 # =========================================================
 # CLIENTE DO TELEGRAM
 # =========================================================
@@ -82,83 +94,27 @@ async def init_db():
     await database.execute(query=query)
 
 # =========================================================
-# INTELIGÊNCIA ARTIFICIAL ANALISADORA DE CONTEÚDO (GEMINI)
+# PARSER INTELIGENTE DE TEXTO E LEGENDA (LOCAL)
 # =========================================================
 
-def ai_analyze_message(text: str, filename: str):
-    if not GEMINI_API_KEY:
-        return None
+def parse_media_text(raw_text: str):
+    if not raw_text:
+        return "movie", None, None, "", None
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-    
-    prompt = f"""
-    Você é um assistente especialista em catalogação de filmes e séries para Stremio/Cinemeta.
-    Analise o nome do arquivo e o texto da mensagem do Telegram e extraia as informações de mídia.
-
-    Nome do arquivo: "{filename}"
-    Legenda/Texto: "{text}"
-
-    Regras Importantes:
-    1. Se você souber o ID do IMDb com certeza (ex: tt16026746 para X-Men 97, tt0079817 para Rocky II, tt0317219 para Carros, tt0356634 para Garfield), coloque o ID no campo "imdb_id".
-    2. Remova apóstrofos, pontuações e subtítulos do campo "title" (ex: "X-Men 97" em vez de "X-Men '97", "Rocky II" em vez de "Rocky II: A Revanche", "Garfield" em vez de "Garfield: O Filme").
-    3. No campo "original_title", coloque o título em inglês/original (ex: "Cars", "Garfield: The Movie", "Rocky II").
-
-    Responda EXATAMENTE e APENAS em formato JSON válido com esta estrutura:
-    {{
-        "imdb_id": "ttXXXXXXX" ou null,
-        "title": "Título limpo em português sem apóstrofos/subtítulos",
-        "original_title": "Título original em inglês",
-        "type": "movie" ou "series",
-        "season": número inteiro (ou 1 se for série sem temporada explícita, ou null se filme),
-        "episode": número inteiro (ou null se filme)
-    }}
-    """
-
-    headers = {"Content-Type": "application/json"}
-    payload = {
-        "contents": [{
-            "parts": [{"text": prompt}]
-        }],
-        "generationConfig": {
-            "response_mime_type": "application/json"
-        }
-    }
-
-    try:
-        r = requests.post(url, json=payload, headers=headers, timeout=10)
-        if r.status_code == 200:
-            result = r.json()
-            raw_json = result["candidates"][0]["content"]["parts"][0]["text"]
-            data = json.loads(raw_json)
-            print(f"[IA SUCCESS]: {data}")
-            return data
-    except Exception as e:
-        print(f"[IA ERROR]: {e}")
-    
-    return None
-
-# =========================================================
-# PARSER REGEX (FALLBACK CASO A IA NÃO ESTEJA DISPONÍVEL)
-# =========================================================
-
-def parse_media_filename(filename: str):
+    # 1. Detecta ID do IMDb se existir na mensagem (ex: tt16026746)
     explicit_imdb = None
-    imdb_match = re.search(r'\b(tt\d{7,8})\b', filename)
+    imdb_match = re.search(r'\b(tt\d{7,8})\b', raw_text)
     if imdb_match:
         explicit_imdb = imdb_match.group(1)
 
-    name_clean = re.sub(r'\.(mp4|mkv|avi|mov|flv|wmv)$', '', filename, flags=re.IGNORECASE)
-    name_clean = re.sub(r'@[A-Za-z0-9_]+', '', name_clean)
-    name_clean = re.sub(r'https?://\S+|www\.\S+', '', name_clean)
-    name_clean = name_clean.replace(".", " ").replace("_", " ").replace("-", " ")
-
+    # 2. Extrai Temporada e Episódio
     content_type = "movie"
     season = None
     episode = None
 
-    se_pattern = re.search(r'[Ss](\d{1,2})[\s._-]*[Ee](\d{1,2})', filename)
-    x_pattern = re.search(r'(\d{1,2})[Xx](\d{1,2})', filename)
-    ep_pattern = re.search(r'(?:[Ee]|Episodio|Ep)[\s._-]*(\d{1,2})', filename, re.IGNORECASE)
+    se_pattern = re.search(r'[Ss](\d{1,2})[\s._-]*[Ee](\d{1,2})', raw_text)
+    x_pattern = re.search(r'(\d{1,2})[Xx](\d{1,2})', raw_text)
+    ep_pattern = re.search(r'(?:[Ee]|Episodio|Episódio|Ep)[\s._-]*(\d{1,2})', raw_text, re.IGNORECASE)
 
     if se_pattern:
         content_type = "series"
@@ -173,25 +129,79 @@ def parse_media_filename(filename: str):
         season = 1
         episode = int(ep_pattern.group(1))
 
-    query_title = re.sub(
-        r'(?i)\b(1080p|720p|480p|2160p|4k|x264|x265|hevc|bluray|webrip|web-dl|h264|h265|aac|dual|dublado|legendado)\b',
-        '',
-        name_clean
-    )
-    query_title = re.sub(r'(?i)[Ss]\d{1,2}[\s._-]*[Ee]\d{1,2}', '', query_title)
-    query_title = re.sub(r'\b\d{1,2}[Xx]\d{1,2}\b', '', query_title)
-    query_title = re.sub(r'(?i)\b(?:[Ee]|Episodio|Ep)[\s._-]*\d{1,2}\b', '', query_title)
-    query_title = re.sub(r'\b(tt\d{7,8})\b', '', query_title)
-    query_title = re.sub(r'\s+', ' ', query_title).strip()
+    # 3. Isolamento e Limpeza do Título (Remove Markdown e Ruídos)
+    lines = [l.strip() for l in raw_text.split('\n') if l.strip()]
+    first_line = lines[0] if lines else raw_text
 
-    return content_type, season, episode, query_title, explicit_imdb
+    clean_title = re.sub(r'\[.*?\]\(.*?\)', '', first_line)  # Remove links Markdown
+    clean_title = re.sub(r'[\*\_~`#]', '', clean_title)     # Remove símbolos de negrito/itálico
+    clean_title = re.sub(r'@[A-Za-z0-9_]+', '', clean_title) # Remove arrobas
+    clean_title = re.sub(r'https?://\S+|www\.\S+', '', clean_title) # Remove URLs
+    clean_title = re.sub(r'\.(mp4|mkv|avi|mov|flv|wmv)$', '', clean_title, flags=re.IGNORECASE)
+
+    # Remove padrões de episódios do título
+    clean_title = re.sub(r'(?i)[Ss]\d{1,2}[\s._-]*[Ee]\d{1,2}', '', clean_title)
+    clean_title = re.sub(r'\b\d{1,2}[Xx]\d{1,2}\b', '', clean_title)
+    clean_title = re.sub(r'(?i)\b(?:[Ee]|Episodio|Episódio|Ep)[\s._-]*\d{1,2}\b', '', clean_title)
+
+    # Remove ruídos de áudio/qualidade
+    clean_title = re.sub(
+        r'(?i)\b(1080p|720p|480p|2160p|4k|x264|x265|hevc|bluray|webrip|web-dl|h264|h265|aac|dual|dublado|legendado|audio|áudio|portugues|português)\b',
+        '',
+        clean_title
+    )
+    clean_title = re.sub(r'\b(tt\d{7,8})\b', '', clean_title)
+    clean_title = re.sub(r'\s+', ' ', clean_title).strip()
+
+    return content_type, season, episode, clean_title, explicit_imdb
 
 # =========================================================
-# BUSCA INTELIGENTE NO CINEMETA (COM HIGIENIZAÇÃO MULTI-TERMO)
+# INTELIGÊNCIA ARTIFICIAL (GEMINI - FALLBACK APENAS)
+# =========================================================
+
+def ai_analyze_message(text: str, filename: str):
+    if not GEMINI_API_KEY:
+        return None
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    
+    prompt = f"""
+    Extraia o título limpo, tipo, temporada e episódio do filme/série abaixo.
+    Texto: "{text}" | Arquivo: "{filename}"
+
+    Responda EXATAMENTE em JSON:
+    {{
+        "imdb_id": "ttXXXXXXX" ou null,
+        "title": "Título Limpo sem subtítulo",
+        "original_title": "Título em inglês",
+        "type": "movie" ou "series",
+        "season": número ou null,
+        "episode": número ou null
+    }}
+    """
+
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"response_mime_type": "application/json"}
+    }
+
+    try:
+        r = requests.post(url, json=payload, headers=headers, timeout=8)
+        if r.status_code == 200:
+            result = r.json()
+            raw_json = result["candidates"][0]["content"]["parts"][0]["text"]
+            return json.loads(raw_json)
+    except Exception:
+        pass
+    
+    return None
+
+# =========================================================
+# BUSCA INTELIGENTE NO CINEMETA
 # =========================================================
 
 def search_cinemeta(query_name: str, content_type: str, explicit_imdb: str = None, original_title: str = None):
-    # 1. Se um IMDb ID foi fornecido diretamente (via Regex ou IA)
     if explicit_imdb and str(explicit_imdb).startswith("tt"):
         url = f"https://v3-cinemeta.strem.io/meta/{content_type}/{explicit_imdb}.json"
         try:
@@ -207,28 +217,33 @@ def search_cinemeta(query_name: str, content_type: str, explicit_imdb: str = Non
     if not query_name and not original_title:
         return None, None
 
-    # Monta lista inteligente de termos de busca
     search_terms = []
+
     if query_name:
         search_terms.append(query_name)
-        
-        # Remove apóstrofos e caracteres especiais (ex: X-Men '97 -> X-Men 97)
+
+        # Mapeamento PT-BR
+        low_query = query_name.lower().strip()
+        if low_query in TITLE_TRANSLATIONS:
+            search_terms.append(TITLE_TRANSLATIONS[low_query])
+
+        # Remove apóstrofos e pontuação (ex: X-Men '97 -> X-Men 97)
         clean_term = re.sub(r"[^\w\s]", " ", query_name)
         clean_term = re.sub(r"\s+", " ", clean_term).strip()
-        if clean_term not in search_terms:
+        if clean_term and clean_term not in search_terms:
             search_terms.append(clean_term)
 
-        # Remove subtítulos (ex: Rocky II: A Revanche -> Rocky II)
-        main_title = query_name.split(":")[0].split("-")[0].strip()
-        if main_title and main_title not in search_terms:
-            search_terms.append(main_title)
+        # Separa subtítulos (ex: Garfield: O Filme -> Garfield)
+        sub_title = re.split(r'[:\-]', query_name)[0].strip()
+        if sub_title and sub_title not in search_terms:
+            search_terms.append(sub_title)
+            clean_sub = re.sub(r"[^\w\s]", " ", sub_title)
+            clean_sub = re.sub(r"\s+", " ", clean_sub).strip()
+            if clean_sub and clean_sub not in search_terms:
+                search_terms.append(clean_sub)
 
     if original_title and original_title not in search_terms:
         search_terms.append(original_title)
-        clean_orig = re.sub(r"[^\w\s]", " ", original_title)
-        clean_orig = re.sub(r"\s+", " ", clean_orig).strip()
-        if clean_orig not in search_terms:
-            search_terms.append(clean_orig)
 
     search_types = [content_type]
     alt_type = "movie" if content_type == "series" else "series"
@@ -251,7 +266,7 @@ def search_cinemeta(query_name: str, content_type: str, explicit_imdb: str = Non
     return None, None
 
 # =========================================================
-# PROCESSADOR DE MENSAGEM (IA + FALLBACK REGEX + UPSERT)
+# PROCESSADOR DE MENSAGEM
 # =========================================================
 
 async def process_and_save_message(msg):
@@ -260,29 +275,30 @@ async def process_and_save_message(msg):
 
     filename = getattr(msg.file, "name", "") or ""
     caption_text = msg.text or ""
+    full_raw_text = f"{caption_text}\n{filename}".strip()
 
-    if not filename and not caption_text:
+    if not full_raw_text:
         return False, None
 
-    # 1. TENTA PROCESSAR VIA IA (GEMINI)
-    ai_data = ai_analyze_message(caption_text, filename)
+    # 1. PARSER LOCAL ULTRA-RÁPIDO (0.001s)
+    content_type, season, episode, query_name, explicit_imdb = parse_media_text(full_raw_text)
+    imdb_id, title = search_cinemeta(query_name, content_type, explicit_imdb)
 
-    if ai_data and (ai_data.get("title") or ai_data.get("imdb_id")):
-        content_type = ai_data.get("type", "movie")
-        season = ai_data.get("season")
-        episode = ai_data.get("episode")
-        query_name = ai_data.get("title")
-        original_title = ai_data.get("original_title")
-        explicit_imdb = ai_data.get("imdb_id")
-    else:
-        # 2. FALLBACK PARA PARSER REGEX
-        content_type, season, episode, query_name, explicit_imdb = parse_media_filename(filename)
-        original_title = None
-
-    imdb_id, title = search_cinemeta(query_name, content_type, explicit_imdb, original_title)
+    # 2. FALLBACK PARA IA GEMINI SE O PARSER LOCAL NÃO ACHAR NO CINEMETA
+    if not imdb_id and GEMINI_API_KEY:
+        ai_data = ai_analyze_message(caption_text, filename)
+        if ai_data and (ai_data.get("title") or ai_data.get("imdb_id")):
+            content_type = ai_data.get("type", content_type)
+            season = ai_data.get("season", season)
+            episode = ai_data.get("episode", episode)
+            query_name = ai_data.get("title", query_name)
+            explicit_imdb = ai_data.get("imdb_id", explicit_imdb)
+            orig_title = ai_data.get("original_title")
+            
+            imdb_id, title = search_cinemeta(query_name, content_type, explicit_imdb, orig_title)
 
     if not imdb_id:
-        return False, query_name or filename or caption_text[:30]
+        return False, query_name or caption_text[:30] or filename
 
     await database.execute(
         "DELETE FROM entries WHERE message_id = :mid",
@@ -429,9 +445,9 @@ async def reindex_channel():
 def manifest():
     return {
         "id": "org.telaverde.hybrid",
-        "version": "8.1.0",
+        "version": "8.2.0",
         "name": "TelaVerde Ultra",
-        "description": "Telegram Streaming + Smart AI & Multi-term Cinemeta",
+        "description": "Telegram Streaming + Local Engine & Smart Fallback AI",
         "resources": ["stream", "catalog", "meta"],
         "types": ["movie", "series"],
         "idPrefixes": ["tt"],
