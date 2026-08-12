@@ -4,6 +4,7 @@
 
 import os
 import re
+import json
 import traceback
 from urllib.parse import quote
 from contextlib import asynccontextmanager
@@ -29,6 +30,7 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID", 0))
 
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 FIMOO_API_URL = "https://fenixflix-search.vercel.app/search"
 CHUNK_SIZE = 1024 * 1024 * 2
@@ -57,7 +59,7 @@ database = Database(
     min_size=1,
     max_size=5,
     timeout=60,
-    statement_cache_size=0  # Previne erro DuplicatePreparedStatementError no PgBouncer
+    statement_cache_size=0
 )
 
 # =========================================================
@@ -80,27 +82,73 @@ async def init_db():
     await database.execute(query=query)
 
 # =========================================================
-# PARSER AVANÇADO E SANITIZADOR DE NOMES DE ARQUIVO
+# INTELIGÊNCIA ARTIFICIAL ANALISADORA DE CONTEÚDO (GEMINI)
+# =========================================================
+
+def ai_analyze_message(text: str, filename: str):
+    """
+    Envia o texto e o nome do arquivo para o Gemini extrair 
+    os metadados exatos (Título, Tipo, Temporada, Episódio) em JSON.
+    """
+    if not GEMINI_API_KEY:
+        return None
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    
+    prompt = f"""
+    Você é um assistente especializado em catalogação de mídias de vídeo para streaming.
+    Analise o nome do arquivo e o texto da legenda abaixo e extraia as informações exatas.
+
+    Nome do arquivo: "{filename}"
+    Texto/Legenda da mensagem: "{text}"
+
+    Responda EXATAMENTE e APENAS em formato JSON válido com a seguinte estrutura:
+    {{
+        "title": "Nome Limpo do Filme ou Série",
+        "type": "movie" ou "series",
+        "season": número inteiro da temporada (ou 1 se for série e não especificado, ou null se for filme),
+        "episode": número inteiro do episódio (ou null se for filme)
+    }}
+    """
+
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "contents": [{
+            "parts": [{"text": prompt}]
+        }],
+        "generationConfig": {
+            "response_mime_type": "application/json"
+        }
+    }
+
+    try:
+        r = requests.post(url, json=payload, headers=headers, timeout=10)
+        if r.status_code == 200:
+            result = r.json()
+            raw_json = result["candidates"][0]["content"]["parts"][0]["text"]
+            data = json.loads(raw_json)
+            print(f"[IA SUCCESS]: {data}")
+            return data
+    except Exception as e:
+        print(f"[IA ERROR]: {e}")
+    
+    return None
+
+# =========================================================
+# PARSER REGEX (FALLBACK CASO A IA NÃO ESTEJA DISPONÍVEL)
 # =========================================================
 
 def parse_media_filename(filename: str):
-    # 1. Detecta se há um IMDb ID explícito (ex: tt16026746) no texto
     explicit_imdb = None
     imdb_match = re.search(r'\b(tt\d{7,8})\b', filename)
     if imdb_match:
         explicit_imdb = imdb_match.group(1)
 
-    # 2. Remove extensão do arquivo (.mp4, .mkv, etc.)
     name_clean = re.sub(r'\.(mp4|mkv|avi|mov|flv|wmv)$', '', filename, flags=re.IGNORECASE)
-
-    # 3. Remove tags, arrobas e links (@FenixFilmes, t.me/..., etc.)
     name_clean = re.sub(r'@[A-Za-z0-9_]+', '', name_clean)
     name_clean = re.sub(r'https?://\S+|www\.\S+', '', name_clean)
-
-    # 4. Normaliza separadores
     name_clean = name_clean.replace(".", " ").replace("_", " ").replace("-", " ")
 
-    # 5. Extração de Temporada e Episódio
     content_type = "movie"
     season = None
     episode = None
@@ -122,7 +170,6 @@ def parse_media_filename(filename: str):
         season = 1
         episode = int(ep_pattern.group(1))
 
-    # 6. Limpeza de termos de busca no Cinemeta
     query_title = re.sub(
         r'(?i)\b(1080p|720p|480p|2160p|4k|x264|x265|hevc|bluray|webrip|web-dl|h264|h265|aac|dual|dublado|legendado)\b',
         '',
@@ -182,24 +229,37 @@ def search_cinemeta(query_name: str, content_type: str, explicit_imdb: str = Non
     return None, None
 
 # =========================================================
-# PROCESSADOR DE MENSAGEM (SMART UPSERT)
+# PROCESSADOR DE MENSAGEM (IA + FALLBACK REGEX + UPSERT)
 # =========================================================
 
 async def process_and_save_message(msg):
     if not msg.media:
         return False, None
 
-    filename = getattr(msg.file, "name", None)
-    if not filename:
+    filename = getattr(msg.file, "name", "") or ""
+    caption_text = msg.text or ""
+
+    if not filename and not caption_text:
         return False, None
 
-    content_type, season, episode, query_name, explicit_imdb = parse_media_filename(filename)
+    # 1. TENTA PROCESSAR VIA IA (GEMINI)
+    ai_data = ai_analyze_message(caption_text, filename)
+
+    if ai_data and ai_data.get("title"):
+        content_type = ai_data.get("type", "movie")
+        season = ai_data.get("season")
+        episode = ai_data.get("episode")
+        query_name = ai_data.get("title")
+        explicit_imdb = None
+    else:
+        # 2. FALLBACK PARA PARSER REGEX
+        content_type, season, episode, query_name, explicit_imdb = parse_media_filename(filename)
+
     imdb_id, title = search_cinemeta(query_name, content_type, explicit_imdb)
 
     if not imdb_id:
-        return False, filename
+        return False, filename or caption_text[:30]
 
-    # Remove registros antigos associados à mesma mensagem para atualizar metadados
     await database.execute(
         "DELETE FROM entries WHERE message_id = :mid",
         {"mid": msg.id}
@@ -271,7 +331,8 @@ app.add_middleware(
 async def root():
     return {
         "status": "online",
-        "telegram_connected": client.is_connected()
+        "telegram_connected": client.is_connected(),
+        "ai_enabled": bool(GEMINI_API_KEY)
     }
 
 # Inspetor do Banco
@@ -284,7 +345,7 @@ async def list_entries():
     )
     return [dict(row) for row in rows]
 
-# Busca por ID do IMDb ou Título
+# Diagnóstico por ID ou Nome
 @app.get("/check/{query}")
 async def check_entry(query: str):
     rows = await database.fetch_all(
@@ -298,7 +359,7 @@ async def check_entry(query: str):
     )
     return [dict(row) for row in rows]
 
-# Rota de Correção Manual via Navegador
+# Correção Manual
 @app.get("/fix/{message_id}/{season}/{episode}")
 async def fix_entry(message_id: int, season: int, episode: int):
     await database.execute(
@@ -342,9 +403,9 @@ async def reindex_channel():
 def manifest():
     return {
         "id": "org.telaverde.hybrid",
-        "version": "7.4.0",
+        "version": "8.0.0",
         "name": "TelaVerde Ultra",
-        "description": "Telegram Streaming + Smart Fallback & Fixer",
+        "description": "Telegram Streaming + AI Gemini Powered",
         "resources": ["stream", "catalog", "meta"],
         "types": ["movie", "series"],
         "idPrefixes": ["tt"],
@@ -439,7 +500,7 @@ async def stream_handler(type: str, stremio_id: str):
             {"imdb_id": imdb_id}
         )
     else:
-        # 1. Busca Exata: IMDb ID + Temporada + Episódio
+        # 1. Busca Exata
         row = await database.fetch_one(
             """
             SELECT message_id, title
@@ -450,7 +511,7 @@ async def stream_handler(type: str, stremio_id: str):
             {"imdb_id": imdb_id, "season": season, "episode": episode}
         )
 
-        # 2. Fallback Inteligente: Se a temporada falhar, busca apenas pelo NÚMERO DO EPISÓDIO nessa série
+        # 2. Fallback Inteligente de Episódio
         if not row and episode is not None:
             row = await database.fetch_one(
                 """
