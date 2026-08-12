@@ -2,9 +2,9 @@ fastapi
 uvicorn
 telethon
 requests
+databases[postgresql]
+asyncpg
+sqlalchemy
 python-multipart
 tgcrypto
 cryptg
-databases
-asyncpg
-sqlalchemy
