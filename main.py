@@ -34,9 +34,11 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 FIMOO_API_URL = "https://fenixflix-search.vercel.app/search"
-CHUNK_SIZE = 1024 * 1024 * 2
 
-# MAPA LOCAL DE PROTEÇÃO CONTRA CONFUSÕES CLÁSSICAS (LIVE-ACTION vs ANIMAÇÃO)
+# CHUNK SIZE OTIMIZADO PARA 512KB (PREVINE ESTOURO DE RAM NO RENDER)
+CHUNK_SIZE = 1024 * 512
+
+# MAPA LOCAL DE PROTEÇÃO CONTRA CONFUSÕES CLÁSSICAS
 EXPLICIT_IMDB_MAP = {
     # Cinderela
     "cinderela live action": "tt1661199",
@@ -48,7 +50,7 @@ EXPLICIT_IMDB_MAP = {
     "cinderela animação": "tt0042332",
     "cinderela classico": "tt0042332",
     "cinderela clássico": "tt0042332",
-    "cinderela": "tt0042332",  # Default para o Clássico de 1950
+    "cinderela": "tt0042332",
     
     # Garfield
     "garfield live action": "tt0356634",
@@ -139,7 +141,7 @@ database = Database(
 )
 
 # =========================================================
-# INICIALIZAÇÃO DA TABELA
+# INICIALIZAÇÃO DA TABELA (COM AUTO MIGRATION DE QUALIDADE)
 # =========================================================
 
 async def init_db():
@@ -152,10 +154,17 @@ async def init_db():
         season INTEGER,
         episode INTEGER,
         message_id BIGINT NOT NULL,
+        quality TEXT DEFAULT '1080p',
         created_at TIMESTAMP DEFAULT NOW()
-    )
+    );
     """
     await database.execute(query=query)
+
+    # Adiciona a coluna quality se o banco já existir sem ela
+    try:
+        await database.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS quality TEXT DEFAULT '1080p';")
+    except Exception:
+        pass
 
 # =========================================================
 # EXTRAÇÃO DE RESOLUÇÃO E ÁUDIO
@@ -191,7 +200,7 @@ def extract_quality_tags(text: str) -> str:
     return " | ".join(tags)
 
 # =========================================================
-# PARSER LOCAL COM BUSCA PRIORIZADA POR TAMANHO
+# PARSER LOCAL
 # =========================================================
 
 def parse_media_text(raw_text: str):
@@ -201,7 +210,6 @@ def parse_media_text(raw_text: str):
     low_text = raw_text.lower()
     explicit_imdb = None
 
-    # Varrer chaves ordenadas da maior para a menor string para capturar termos específicos
     for key in sorted(EXPLICIT_IMDB_MAP.keys(), key=len, reverse=True):
         if key in low_text:
             explicit_imdb = EXPLICIT_IMDB_MAP[key]
@@ -257,7 +265,7 @@ def parse_media_text(raw_text: str):
     return content_type, season, episode, clean_title, explicit_imdb
 
 # =========================================================
-# INTELIGÊNCIA ARTIFICIAL (GEMINI - PROMPT COM MODELO CINDERELA E DISNEY)
+# INTELIGÊNCIA ARTIFICIAL (GEMINI)
 # =========================================================
 
 async def ai_analyze_message(text: str, filename: str):
@@ -270,34 +278,16 @@ async def ai_analyze_message(text: str, filename: str):
     Você é a Inteligência Artificial especialista suprema em catalogação do IMDb e Cinemeta/Stremio para o serviço TelaVerde.
     Sua missão é extrair com PRECISÃO ABSOLUTA os metadados de mídia a partir do texto/legenda e nome de arquivo do Telegram.
 
-    [ENTRADAS]
     Legenda: "{text}"
     Nome do Arquivo: "{filename}"
 
-    [MANUAL PREDITIVO DE CATALOGAÇÃO - REGRAS INFALÍVEIS]
-    1. DISTINÇÃO LIVE-ACTION vs. DESENHO/ANIMAÇÃO:
-       - "Cinderela" (1950 Animação Clássica = tt0042332 | 2015 Live-Action = tt1661199 | 2021 Musical = tt1016150)
-       - "Garfield: O Filme" (2004 Live-Action com atores/CGI) = imdb_id "tt0356634"
-       - "Garfield 2" (2006 Live-Action) = imdb_id "tt0463323"
-       - "Garfield: Fora de Casa" (2024 Animação) = imdb_id "tt13398158"
-       - "O Rei Leão" (1994 Animação = tt0110357 | 2019 Live-Action = tt6105098)
-       - "A Pequena Sereia" (1989 Animação = tt0098096 | 2023 Live-Action = tt5971474)
-       - "A Bela e a Fera" (1991 Animação = tt0101414 | 2017 Live-Action = tt2771200)
-       - "Aladdin" (1992 Animação = tt0103639 | 2019 Live-Action = tt6139732)
-       - "Pica-Pau: O Filme" (2017 Live-Action = tt2118686)
-
-    2. REBOOTS, REMAKES E DIFERENCIAÇÃO POR ANO:
-       - Se houver indicação de ano na legenda (ex: 1950, 2015), use-o para apontar o "imdb_id" correto.
-
-    3. ANIME E SÉRIES FRACIONADAS:
-       - Se houver termos como "Ep 03", "Capítulo 03", "Parte 2", "S01E03", defina obrigatoriamente type="series". Se não houver temporada explícita, defina season=1.
-
-    4. TAGS EXPLÍCITAS IMDB:
-       - Se o texto contiver uma tag como [tt0042332] ou tt0042332, retorne este valor exatamente no campo "imdb_id".
-
-    5. HIGIENIZAÇÃO DE TÍTULO PARA CINEMETA:
-       - "title": Título limpo sem qualidade (1080p, 4k) e sem tags de grupo (@...).
-       - "original_title": Título original em inglês (ex: "Cinderella" para Cinderela, "Cars" para Carros).
+    REGRAS DE DISTINÇÃO PREDITIVA:
+    - "Cinderela" (1950 Animação = tt0042332 | 2015 Live-Action = tt1661199)
+    - "Garfield: O Filme" (2004 Live-Action) = tt0356634
+    - "Garfield 2" (2006 Live-Action) = tt0463323
+    - "Garfield: Fora de Casa" (2024 Animação) = tt13398158
+    - "O Rei Leão" (1994 Animação = tt0110357 | 2019 Live-Action = tt6105098)
+    - "A Pequena Sereia" (1989 Animação = tt0098096 | 2023 Live-Action = tt5971474)
 
     Responda EXATAMENTE e APENAS em formato JSON válido:
     {{
@@ -396,7 +386,7 @@ async def search_cinemeta(query_name: str, content_type: str, explicit_imdb: str
     return None, None
 
 # =========================================================
-# PROCESSADOR DE MENSAGEM
+# PROCESSADOR DE MENSAGEM (COM SALVAMENTO DE QUALIDADE NO BANCO)
 # =========================================================
 
 async def process_and_save_message(msg):
@@ -409,6 +399,9 @@ async def process_and_save_message(msg):
 
     if not full_raw_text:
         return False, None
+
+    # Extrai a tag de qualidade no momento do cadastro
+    quality = extract_quality_tags(full_raw_text)
 
     content_type, season, episode, query_name, explicit_imdb = parse_media_text(full_raw_text)
     imdb_id, title = await search_cinemeta(query_name, content_type, explicit_imdb)
@@ -435,8 +428,8 @@ async def process_and_save_message(msg):
 
     await database.execute(
         """
-        INSERT INTO entries (imdb_id, title, type, season, episode, message_id)
-        VALUES (:imdb_id, :title, :type, :season, :episode, :message_id)
+        INSERT INTO entries (imdb_id, title, type, season, episode, message_id, quality)
+        VALUES (:imdb_id, :title, :type, :season, :episode, :message_id, :quality)
         """,
         {
             "imdb_id": imdb_id,
@@ -444,7 +437,8 @@ async def process_and_save_message(msg):
             "type": content_type,
             "season": season,
             "episode": episode,
-            "message_id": msg.id
+            "message_id": msg.id,
+            "quality": quality
         }
     )
     return True, title
@@ -509,7 +503,7 @@ async def root():
 @app.get("/list.json")
 async def list_entries():
     rows = await database.fetch_all(
-        "SELECT id, imdb_id, title, type, season, episode, message_id FROM entries ORDER BY id DESC LIMIT 50"
+        "SELECT id, imdb_id, title, type, season, episode, quality, message_id FROM entries ORDER BY id DESC LIMIT 50"
     )
     return [dict(row) for row in rows]
 
@@ -517,7 +511,7 @@ async def list_entries():
 async def check_entry(query: str):
     rows = await database.fetch_all(
         """
-        SELECT id, imdb_id, title, type, season, episode, message_id 
+        SELECT id, imdb_id, title, type, season, episode, quality, message_id 
         FROM entries 
         WHERE imdb_id LIKE :q OR LOWER(title) LIKE LOWER(:q_like)
         ORDER BY id DESC LIMIT 20
@@ -570,9 +564,9 @@ async def reindex_channel():
 def manifest():
     return {
         "id": "org.telaverde.hybrid",
-        "version": "10.1.0",
-        "name": "TelaVerde Ultra Pro",
-        "description": "Telegram Streaming + Priority Matcher & Disney Classics Protection",
+        "version": "11.0.0",
+        "name": "TelaVerde Ultra Pro Max",
+        "description": "Telegram Streaming + Instant Stream Engine & Native Search",
         "resources": ["stream", "catalog", "meta"],
         "types": ["movie", "series"],
         "idPrefixes": ["tt"],
@@ -580,30 +574,52 @@ def manifest():
             {
                 "type": "movie",
                 "id": "telaverde_movies",
-                "name": "🎬 Filmes"
+                "name": "🎬 Filmes",
+                "extra": [{"name": "search", "isRequired": False}]
             },
             {
                 "type": "series",
                 "id": "telaverde_series",
-                "name": "📺 Séries"
+                "name": "📺 Séries",
+                "extra": [{"name": "search", "isRequired": False}]
             }
         ]
     }
 
+# =========================================================
+# CATÁLOGO COM SUPORTE A BUSCA NATIVA NO STREMIO
+# =========================================================
+
 @app.get("/catalog/{type}/{catalog_id}.json")
-async def catalog(type: str, catalog_id: str):
+@app.get("/catalog/{type}/{catalog_id}/search={search_query}.json")
+async def catalog(type: str, catalog_id: str, search_query: str = None, search: str = None):
     target_type = "movie" if type == "movie" else "series"
-    rows = await database.fetch_all(
-        """
-        SELECT DISTINCT ON (imdb_id)
-            imdb_id, title
-        FROM entries
-        WHERE type=:type
-        ORDER BY imdb_id, id DESC
-        LIMIT 100
-        """,
-        {"type": target_type}
-    )
+    q = search_query or search
+
+    if q:
+        rows = await database.fetch_all(
+            """
+            SELECT DISTINCT ON (imdb_id)
+                imdb_id, title
+            FROM entries
+            WHERE type=:type AND LOWER(title) LIKE LOWER(:q)
+            ORDER BY imdb_id, id DESC
+            LIMIT 100
+            """,
+            {"type": target_type, "q": f"%{q}%"}
+        )
+    else:
+        rows = await database.fetch_all(
+            """
+            SELECT DISTINCT ON (imdb_id)
+                imdb_id, title
+            FROM entries
+            WHERE type=:type
+            ORDER BY imdb_id, id DESC
+            LIMIT 100
+            """,
+            {"type": target_type}
+        )
 
     metas = []
     for row in rows:
@@ -637,6 +653,10 @@ async def meta(type: str, imdb_id: str):
         }
     }
 
+# =========================================================
+# STREAMING ULTRA-RÁPIDO (LEITURA DIRETA DO SUPABASE)
+# =========================================================
+
 @app.get("/stream/{type}/{stremio_id}.json")
 async def stream_handler(type: str, stremio_id: str):
     stremio_id = stremio_id.replace(".json", "").replace("%3A", ":")
@@ -655,13 +675,13 @@ async def stream_handler(type: str, stremio_id: str):
     rows = []
     if type == "movie":
         rows = await database.fetch_all(
-            "SELECT message_id, title FROM entries WHERE imdb_id=:imdb_id AND type='movie' ORDER BY id DESC",
+            "SELECT message_id, title, quality FROM entries WHERE imdb_id=:imdb_id AND type='movie' ORDER BY id DESC",
             {"imdb_id": imdb_id}
         )
     else:
         rows = await database.fetch_all(
             """
-            SELECT message_id, title
+            SELECT message_id, title, quality
             FROM entries
             WHERE imdb_id=:imdb_id AND type='series' AND season=:season AND episode=:episode
             ORDER BY id DESC
@@ -672,7 +692,7 @@ async def stream_handler(type: str, stremio_id: str):
         if not rows and episode is not None:
             rows = await database.fetch_all(
                 """
-                SELECT message_id, title
+                SELECT message_id, title, quality
                 FROM entries
                 WHERE imdb_id=:imdb_id AND type='series' AND episode=:episode
                 ORDER BY id DESC
@@ -683,12 +703,7 @@ async def stream_handler(type: str, stremio_id: str):
     streams = []
     for idx, row in enumerate(rows):
         msg_id = row["message_id"]
-        try:
-            msg = await client.get_messages(CHANNEL_ID, ids=msg_id)
-            raw_info = f"{msg.text or ''} {getattr(msg.file, 'name', '') or ''}"
-            quality_tag = extract_quality_tags(raw_info)
-        except Exception:
-            quality_tag = "1080p"
+        quality_tag = dict(row).get("quality") or "1080p"
 
         stream_title = f"🟢 Option {idx+1} [{quality_tag}]" if len(rows) > 1 else f"🟢 TelaVerde [{quality_tag}]"
 
@@ -722,6 +737,10 @@ async def stream_handler(type: str, stremio_id: str):
         pass
 
     return {"streams": []}
+
+# =========================================================
+# PROXY DE VÍDEO LIGHTWEIGHT
+# =========================================================
 
 @app.api_route("/video/{message_id}", methods=["GET", "HEAD"])
 async def video_proxy(request: Request, message_id: int):
