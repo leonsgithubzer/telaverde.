@@ -9,10 +9,10 @@ import traceback
 from urllib.parse import quote
 from contextlib import asynccontextmanager
 
-import requests
+import httpx
 from databases import Database
 
-from fastapi import FastAPI, Header, Response
+from fastapi import FastAPI, Header, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -35,7 +35,6 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 FIMOO_API_URL = "https://fenixflix-search.vercel.app/search"
 CHUNK_SIZE = 1024 * 1024 * 2
 
-# DICIONÁRIO DE TRADUÇÕES PT-BR PARA CINEMETA
 TITLE_TRANSLATIONS = {
     "carros": "Cars",
     "divertida mente": "Inside Out",
@@ -63,7 +62,7 @@ client = TelegramClient(
 )
 
 # =========================================================
-# CONEXÃO COM O BANCO DE DADOS (SUPABASE / PGBOUNCER)
+# CONEXÃO COM O BANCO DE DADOS
 # =========================================================
 
 database = Database(
@@ -94,20 +93,40 @@ async def init_db():
     await database.execute(query=query)
 
 # =========================================================
-# PARSER INTELIGENTE DE TEXTO E LEGENDA (LOCAL)
+# PARSER LOCAL E EXTRAÇÃO DE QUALIDADE
 # =========================================================
+
+def extract_quality_tags(text: str) -> str:
+    tags = []
+    text_upper = text.upper()
+    
+    if "2160P" in text_upper or "4K" in text_upper:
+        tags.append("4K")
+    elif "1080P" in text_upper:
+        tags.append("1080p")
+    elif "720P" in text_upper:
+        tags.append("720p")
+    elif "480P" in text_upper:
+        tags.append("480p")
+
+    if "DUAL" in text_upper:
+        tags.append("Dual Áudio")
+    elif "DUBLADO" in text_upper:
+        tags.append("Dublado")
+    elif "LEGENDADO" in text_upper:
+        tags.append("Legendado")
+
+    return " | ".join(tags) if tags else "HD"
 
 def parse_media_text(raw_text: str):
     if not raw_text:
         return "movie", None, None, "", None
 
-    # 1. Detecta ID do IMDb se existir na mensagem (ex: tt16026746)
     explicit_imdb = None
     imdb_match = re.search(r'\b(tt\d{7,8})\b', raw_text)
     if imdb_match:
         explicit_imdb = imdb_match.group(1)
 
-    # 2. Extrai Temporada e Episódio
     content_type = "movie"
     season = None
     episode = None
@@ -129,22 +148,19 @@ def parse_media_text(raw_text: str):
         season = 1
         episode = int(ep_pattern.group(1))
 
-    # 3. Isolamento e Limpeza do Título (Remove Markdown e Ruídos)
     lines = [l.strip() for l in raw_text.split('\n') if l.strip()]
     first_line = lines[0] if lines else raw_text
 
-    clean_title = re.sub(r'\[.*?\]\(.*?\)', '', first_line)  # Remove links Markdown
-    clean_title = re.sub(r'[\*\_~`#]', '', clean_title)     # Remove símbolos de negrito/itálico
-    clean_title = re.sub(r'@[A-Za-z0-9_]+', '', clean_title) # Remove arrobas
-    clean_title = re.sub(r'https?://\S+|www\.\S+', '', clean_title) # Remove URLs
+    clean_title = re.sub(r'\[.*?\]\(.*?\)', '', first_line)
+    clean_title = re.sub(r'[\*\_~`#]', '', clean_title)
+    clean_title = re.sub(r'@[A-Za-z0-9_]+', '', clean_title)
+    clean_title = re.sub(r'https?://\S+|www\.\S+', '', clean_title)
     clean_title = re.sub(r'\.(mp4|mkv|avi|mov|flv|wmv)$', '', clean_title, flags=re.IGNORECASE)
 
-    # Remove padrões de episódios do título
     clean_title = re.sub(r'(?i)[Ss]\d{1,2}[\s._-]*[Ee]\d{1,2}', '', clean_title)
     clean_title = re.sub(r'\b\d{1,2}[Xx]\d{1,2}\b', '', clean_title)
     clean_title = re.sub(r'(?i)\b(?:[Ee]|Episodio|Episódio|Ep)[\s._-]*\d{1,2}\b', '', clean_title)
 
-    # Remove ruídos de áudio/qualidade
     clean_title = re.sub(
         r'(?i)\b(1080p|720p|480p|2160p|4k|x264|x265|hevc|bluray|webrip|web-dl|h264|h265|aac|dual|dublado|legendado|audio|áudio|portugues|português)\b',
         '',
@@ -156,10 +172,10 @@ def parse_media_text(raw_text: str):
     return content_type, season, episode, clean_title, explicit_imdb
 
 # =========================================================
-# INTELIGÊNCIA ARTIFICIAL (GEMINI - FALLBACK APENAS)
+# INTELIGÊNCIA ARTIFICIAL (GEMINI - ASSÍNCRONA)
 # =========================================================
 
-def ai_analyze_message(text: str, filename: str):
+async def ai_analyze_message(text: str, filename: str):
     if not GEMINI_API_KEY:
         return None
 
@@ -187,29 +203,31 @@ def ai_analyze_message(text: str, filename: str):
     }
 
     try:
-        r = requests.post(url, json=payload, headers=headers, timeout=8)
-        if r.status_code == 200:
-            result = r.json()
-            raw_json = result["candidates"][0]["content"]["parts"][0]["text"]
-            return json.loads(raw_json)
+        async with httpx.AsyncClient(timeout=8) as http_client:
+            r = await http_client.post(url, json=payload, headers=headers)
+            if r.status_code == 200:
+                result = r.json()
+                raw_json = result["candidates"][0]["content"]["parts"][0]["text"]
+                return json.loads(raw_json)
     except Exception:
         pass
     
     return None
 
 # =========================================================
-# BUSCA INTELIGENTE NO CINEMETA
+# BUSCA INTELIGENTE NO CINEMETA (ASSÍNCRONA)
 # =========================================================
 
-def search_cinemeta(query_name: str, content_type: str, explicit_imdb: str = None, original_title: str = None):
+async def search_cinemeta(query_name: str, content_type: str, explicit_imdb: str = None, original_title: str = None):
     if explicit_imdb and str(explicit_imdb).startswith("tt"):
         url = f"https://v3-cinemeta.strem.io/meta/{content_type}/{explicit_imdb}.json"
         try:
-            r = requests.get(url, timeout=8)
-            if r.status_code == 200:
-                meta = r.json().get("meta", {})
-                if meta.get("name"):
-                    return explicit_imdb, meta["name"]
+            async with httpx.AsyncClient(timeout=8) as http_client:
+                r = await http_client.get(url)
+                if r.status_code == 200:
+                    meta = r.json().get("meta", {})
+                    if meta.get("name"):
+                        return explicit_imdb, meta["name"]
         except Exception:
             pass
         return explicit_imdb, query_name or explicit_imdb
@@ -222,18 +240,15 @@ def search_cinemeta(query_name: str, content_type: str, explicit_imdb: str = Non
     if query_name:
         search_terms.append(query_name)
 
-        # Mapeamento PT-BR
         low_query = query_name.lower().strip()
         if low_query in TITLE_TRANSLATIONS:
             search_terms.append(TITLE_TRANSLATIONS[low_query])
 
-        # Remove apóstrofos e pontuação (ex: X-Men '97 -> X-Men 97)
         clean_term = re.sub(r"[^\w\s]", " ", query_name)
         clean_term = re.sub(r"\s+", " ", clean_term).strip()
         if clean_term and clean_term not in search_terms:
             search_terms.append(clean_term)
 
-        # Separa subtítulos (ex: Garfield: O Filme -> Garfield)
         sub_title = re.split(r'[:\-]', query_name)[0].strip()
         if sub_title and sub_title not in search_terms:
             search_terms.append(sub_title)
@@ -249,19 +264,20 @@ def search_cinemeta(query_name: str, content_type: str, explicit_imdb: str = Non
     alt_type = "movie" if content_type == "series" else "series"
     search_types.append(alt_type)
 
-    for stype in search_types:
-        for term in search_terms:
-            if not term or len(term) < 2:
-                continue
-            url = f"https://v3-cinemeta.strem.io/catalog/{stype}/top/search={quote(term)}.json"
-            try:
-                r = requests.get(url, timeout=8)
-                if r.status_code == 200:
-                    metas = r.json().get("metas", [])
-                    if metas:
-                        return metas[0]["id"], metas[0]["name"]
-            except Exception:
-                continue
+    async with httpx.AsyncClient(timeout=8) as http_client:
+        for stype in search_types:
+            for term in search_terms:
+                if not term or len(term) < 2:
+                    continue
+                url = f"https://v3-cinemeta.strem.io/catalog/{stype}/top/search={quote(term)}.json"
+                try:
+                    r = await http_client.get(url)
+                    if r.status_code == 200:
+                        metas = r.json().get("metas", [])
+                        if metas:
+                            return metas[0]["id"], metas[0]["name"]
+                except Exception:
+                    continue
 
     return None, None
 
@@ -280,13 +296,11 @@ async def process_and_save_message(msg):
     if not full_raw_text:
         return False, None
 
-    # 1. PARSER LOCAL ULTRA-RÁPIDO (0.001s)
     content_type, season, episode, query_name, explicit_imdb = parse_media_text(full_raw_text)
-    imdb_id, title = search_cinemeta(query_name, content_type, explicit_imdb)
+    imdb_id, title = await search_cinemeta(query_name, content_type, explicit_imdb)
 
-    # 2. FALLBACK PARA IA GEMINI SE O PARSER LOCAL NÃO ACHAR NO CINEMETA
     if not imdb_id and GEMINI_API_KEY:
-        ai_data = ai_analyze_message(caption_text, filename)
+        ai_data = await ai_analyze_message(caption_text, filename)
         if ai_data and (ai_data.get("title") or ai_data.get("imdb_id")):
             content_type = ai_data.get("type", content_type)
             season = ai_data.get("season", season)
@@ -295,7 +309,7 @@ async def process_and_save_message(msg):
             explicit_imdb = ai_data.get("imdb_id", explicit_imdb)
             orig_title = ai_data.get("original_title")
             
-            imdb_id, title = search_cinemeta(query_name, content_type, explicit_imdb, orig_title)
+            imdb_id, title = await search_cinemeta(query_name, content_type, explicit_imdb, orig_title)
 
     if not imdb_id:
         return False, query_name or caption_text[:30] or filename
@@ -322,7 +336,7 @@ async def process_and_save_message(msg):
     return True, title
 
 # =========================================================
-# AUTO INDEXAÇÃO (NOVAS MENSAGENS)
+# AUTO INDEXAÇÃO
 # =========================================================
 
 @client.on(events.NewMessage(chats=CHANNEL_ID))
@@ -376,7 +390,6 @@ async def root():
         "ai_enabled": bool(GEMINI_API_KEY)
     }
 
-# Inspetor do Banco
 @app.get("/list")
 @app.get("/list/")
 @app.get("/list.json")
@@ -386,7 +399,6 @@ async def list_entries():
     )
     return [dict(row) for row in rows]
 
-# Diagnóstico por ID ou Nome
 @app.get("/check/{query}")
 async def check_entry(query: str):
     rows = await database.fetch_all(
@@ -400,7 +412,6 @@ async def check_entry(query: str):
     )
     return [dict(row) for row in rows]
 
-# Correção Manual
 @app.get("/fix/{message_id}/{season}/{episode}")
 async def fix_entry(message_id: int, season: int, episode: int):
     await database.execute(
@@ -445,9 +456,9 @@ async def reindex_channel():
 def manifest():
     return {
         "id": "org.telaverde.hybrid",
-        "version": "8.2.0",
-        "name": "TelaVerde Ultra",
-        "description": "Telegram Streaming + Local Engine & Smart Fallback AI",
+        "version": "9.0.0",
+        "name": "TelaVerde Ultra Pro",
+        "description": "Telegram Streaming + Async HTTPX Engine & Metahub Posters",
         "resources": ["stream", "catalog", "meta"],
         "types": ["movie", "series"],
         "idPrefixes": ["tt"],
@@ -467,36 +478,27 @@ def manifest():
 
 @app.get("/catalog/{type}/{catalog_id}.json")
 async def catalog(type: str, catalog_id: str):
-    if type == "movie":
-        rows = await database.fetch_all(
-            """
-            SELECT DISTINCT ON (imdb_id)
-                imdb_id, title
-            FROM entries
-            WHERE type='movie'
-            ORDER BY imdb_id, id DESC
-            LIMIT 100
-            """
-        )
-    else:
-        rows = await database.fetch_all(
-            """
-            SELECT DISTINCT ON (imdb_id)
-                imdb_id, title
-            FROM entries
-            WHERE type='series'
-            ORDER BY imdb_id, id DESC
-            LIMIT 100
-            """
-        )
+    target_type = "movie" if type == "movie" else "series"
+    rows = await database.fetch_all(
+        f"""
+        SELECT DISTINCT ON (imdb_id)
+            imdb_id, title
+        FROM entries
+        WHERE type=:type
+        ORDER BY imdb_id, id DESC
+        LIMIT 100
+        """,
+        {"type": target_type}
+    )
 
     metas = []
     for row in rows:
+        imdb_clean = row["imdb_id"]
         metas.append({
-            "id": row["imdb_id"],
+            "id": imdb_clean,
             "type": type,
             "name": row["title"],
-            "poster": "https://via.placeholder.com/300x450.png?text=TelaVerde"
+            "poster": f"https://images.metahub.space/poster/medium/{imdb_clean}/img"
         })
 
     return {"metas": metas}
@@ -517,7 +519,7 @@ async def meta(type: str, imdb_id: str):
             "id": imdb_id,
             "type": type,
             "name": title,
-            "poster": "https://via.placeholder.com/300x450.png?text=TelaVerde"
+            "poster": f"https://images.metahub.space/poster/medium/{imdb_clean}/img"
         }
     }
 
@@ -536,80 +538,95 @@ async def stream_handler(type: str, stremio_id: str):
             season = int(parts[1])
             episode = int(parts[2])
 
+    rows = []
     if type == "movie":
-        row = await database.fetch_one(
-            "SELECT message_id, title FROM entries WHERE imdb_id=:imdb_id AND type='movie' ORDER BY id DESC LIMIT 1",
+        rows = await database.fetch_all(
+            "SELECT message_id, title FROM entries WHERE imdb_id=:imdb_id AND type='movie' ORDER BY id DESC",
             {"imdb_id": imdb_id}
         )
     else:
-        # 1. Busca Exata
-        row = await database.fetch_one(
+        # Busca exata
+        rows = await database.fetch_all(
             """
             SELECT message_id, title
             FROM entries
             WHERE imdb_id=:imdb_id AND type='series' AND season=:season AND episode=:episode
-            ORDER BY id DESC LIMIT 1
+            ORDER BY id DESC
             """,
             {"imdb_id": imdb_id, "season": season, "episode": episode}
         )
 
-        # 2. Fallback Inteligente de Episódio
-        if not row and episode is not None:
-            row = await database.fetch_one(
+        # Fallback de episódio
+        if not rows and episode is not None:
+            rows = await database.fetch_all(
                 """
                 SELECT message_id, title
                 FROM entries
                 WHERE imdb_id=:imdb_id AND type='series' AND episode=:episode
-                ORDER BY id DESC LIMIT 1
+                ORDER BY id DESC
                 """,
                 {"imdb_id": imdb_id, "episode": episode}
             )
 
-    if row:
-        return {
-            "streams": [
-                {
-                    "name": "🟢 TelaVerde",
-                    "title": row["title"],
-                    "url": f"{PUBLIC_BASE_URL}/video/{row['message_id']}"
-                }
-            ]
-        }
+    streams = []
+    for idx, row in enumerate(rows):
+        msg_id = row["message_id"]
+        # Busca o texto do Telegram para extrair tags de qualidade
+        try:
+            msg = await client.get_messages(CHANNEL_ID, ids=msg_id)
+            raw_info = f"{msg.text or ''} {getattr(msg.file, 'name', '') or ''}"
+            quality_tag = extract_quality_tags(raw_info)
+        except Exception:
+            quality_tag = "HD"
 
-    # Fallback para a API secundária (Fimoo)
+        stream_title = f"🟢 Option {idx+1} [{quality_tag}]" if len(rows) > 1 else f"🟢 TelaVerde [{quality_tag}]"
+
+        streams.append({
+            "name": "🟢 TelaVerde",
+            "title": stream_title,
+            "url": f"{PUBLIC_BASE_URL}/video/{msg_id}"
+        })
+
+    if streams:
+        return {"streams": streams}
+
+    # Fallback para API secundária (Fimoo)
     try:
         query = f"{imdb_id}:{season}:{episode}" if (type == "series" and season is not None) else imdb_id
-        r = requests.get(f"{FIMOO_API_URL}/{query}", timeout=5)
-        if r.status_code == 200:
-            data = r.json()
-            if "message_id" in data:
-                return {
-                    "streams": [
-                        {
-                            "name": "🔥 Fimoo",
-                            "title": data.get("title", "Auto Encontrado"),
-                            "url": f"{PUBLIC_BASE_URL}/video/{data['message_id']}"
-                        }
-                    ]
-                }
+        async with httpx.AsyncClient(timeout=5) as http_client:
+            r = await http_client.get(f"{FIMOO_API_URL}/{query}")
+            if r.status_code == 200:
+                data = r.json()
+                if "message_id" in data:
+                    return {
+                        "streams": [
+                            {
+                                "name": "🔥 Fimoo",
+                                "title": data.get("title", "Auto Encontrado"),
+                                "url": f"{PUBLIC_BASE_URL}/video/{data['message_id']}"
+                            }
+                        ]
+                    }
     except Exception:
         pass
 
     return {"streams": []}
 
-@app.get("/video/{message_id}")
-async def video_proxy(message_id: int, range: str = Header(None)):
+@app.route("/video/{message_id}", methods=["GET", "HEAD"])
+async def video_proxy(request: Request, message_id: int):
     try:
         msg = await client.get_messages(CHANNEL_ID, ids=message_id)
         if not msg:
             return Response(status_code=404)
 
         file_size = msg.file.size
+        range_header = request.headers.get("range")
+
         start = 0
         end = file_size - 1
 
-        if range:
-            match = re.search(r"bytes=(\d+)-(\d*)", range)
+        if range_header:
+            match = re.search(r"bytes=(\d+)-(\d*)", range_header)
             if match:
                 start = int(match.group(1))
                 if match.group(2):
@@ -624,6 +641,10 @@ async def video_proxy(message_id: int, range: str = Header(None)):
             "Content-Type": msg.file.mime_type or "video/mp4",
             "Cache-Control": "public, max-age=3600"
         }
+
+        # Trata requisições HEAD (usadas por Smart TVs e Stremio Web)
+        if request.method == "HEAD":
+            return Response(status_code=206, headers=headers)
 
         async def stream():
             async for chunk in client.iter_download(
