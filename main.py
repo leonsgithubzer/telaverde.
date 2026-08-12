@@ -36,28 +36,70 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 FIMOO_API_URL = "https://fenixflix-search.vercel.app/search"
 CHUNK_SIZE = 1024 * 1024 * 2
 
-# MAPA LOCAL DE PROTEÇÃO CONTRA CONFUSÕES CLÁSSICAS (LIVE-ACTION vs DESENHO)
+# MAPA LOCAL DE PROTEÇÃO CONTRA CONFUSÕES CLÁSSICAS (LIVE-ACTION vs ANIMAÇÃO)
 EXPLICIT_IMDB_MAP = {
+    # Cinderela
+    "cinderela live action": "tt1661199",
+    "cinderela live-action": "tt1661199",
+    "cinderela 2015": "tt1661199",
+    "cinderela 2021": "tt1016150",
+    "cinderela 1950": "tt0042332",
+    "cinderela animacao": "tt0042332",
+    "cinderela animação": "tt0042332",
+    "cinderela classico": "tt0042332",
+    "cinderela clássico": "tt0042332",
+    "cinderela": "tt0042332",  # Default para o Clássico de 1950
+    
     # Garfield
-    "garfield": "tt0356634",
+    "garfield live action": "tt0356634",
     "garfield o filme": "tt0356634",
     "garfield 2": "tt0463323",
     "garfield 2 o filme": "tt0463323",
     "garfield fora de casa": "tt13398158",
+    "garfield 2024": "tt13398158",
+    "garfield": "tt0356634",
+
     # O Rei Leão
-    "o rei leao 1994": "tt0110357",
-    "o rei leão 1994": "tt0110357",
     "o rei leao 2019": "tt6105098",
     "o rei leão 2019": "tt6105098",
+    "o rei leao live action": "tt6105098",
+    "o rei leão live action": "tt6105098",
+    "o rei leao 1994": "tt0110357",
+    "o rei leão 1994": "tt0110357",
+    "o rei leao": "tt0110357",
+    "o rei leão": "tt0110357",
+
     # A Pequena Sereia
-    "a pequena sereia 1989": "tt0098096",
     "a pequena sereia 2023": "tt5971474",
+    "a pequena sereia live action": "tt5971474",
+    "a pequena sereia 1989": "tt0098096",
+    "a pequena sereia": "tt0098096",
+
+    # A Bela e a Fera
+    "a bela e a fera 2017": "tt2771200",
+    "a bela e a fera live action": "tt2771200",
+    "a bela e a fera 1991": "tt0101414",
+    "a bela e a fera": "tt0101414",
+
+    # Aladdin
+    "aladdin 2019": "tt6139732",
+    "aladdin live action": "tt6139732",
+    "aladdin 1992": "tt0103639",
+    "aladdin": "tt0103639",
+
+    # Mulan
+    "mulan 2020": "tt4566758",
+    "mulan live action": "tt4566758",
+    "mulan 1998": "tt0120762",
+    "mulan": "tt0120762",
+
     # Pica-Pau
     "pica pau o filme": "tt2118686",
     "pica-pau o filme": "tt2118686"
 }
 
 TITLE_TRANSLATIONS = {
+    "cinderela": "Cinderella",
     "carros": "Cars",
     "divertida mente": "Inside Out",
     "enrolados": "Tangled",
@@ -116,7 +158,7 @@ async def init_db():
     await database.execute(query=query)
 
 # =========================================================
-# EXTRAÇÃO DE RESOLUÇÃO E ÁUDIO (FORMATO LIMPO E EXPLÍCITO)
+# EXTRAÇÃO DE RESOLUÇÃO E ÁUDIO
 # =========================================================
 
 def extract_quality_tags(text: str) -> str:
@@ -126,7 +168,6 @@ def extract_quality_tags(text: str) -> str:
     text_upper = text.upper()
     tags = []
 
-    # 1. Resolução
     if "2160P" in text_upper or "4K" in text_upper or "UHD" in text_upper:
         tags.append("4K")
     elif "1080P" in text_upper or "FULLHD" in text_upper or "FULL HD" in text_upper:
@@ -136,9 +177,8 @@ def extract_quality_tags(text: str) -> str:
     elif "480P" in text_upper or "SD" in text_upper:
         tags.append("480p")
     else:
-        tags.append("1080p")  # Padrão HD
+        tags.append("1080p")
 
-    # 2. Tipo de Áudio
     if "DUAL" in text_upper or "DUAL AUDIO" in text_upper or "DUAL ÁUDIO" in text_upper:
         tags.append("Dual Áudio")
     elif "DUBLADO" in text_upper or "DUB" in text_upper:
@@ -151,7 +191,7 @@ def extract_quality_tags(text: str) -> str:
     return " | ".join(tags)
 
 # =========================================================
-# PARSER LOCAL COM PROTEÇÃO DIRETA
+# PARSER LOCAL COM BUSCA PRIORIZADA POR TAMANHO
 # =========================================================
 
 def parse_media_text(raw_text: str):
@@ -161,10 +201,10 @@ def parse_media_text(raw_text: str):
     low_text = raw_text.lower()
     explicit_imdb = None
 
-    # Checa no mapa de proteção contra confusão entre Live-Action e Desenhos
-    for key, imdb in EXPLICIT_IMDB_MAP.items():
+    # Varrer chaves ordenadas da maior para a menor string para capturar termos específicos
+    for key in sorted(EXPLICIT_IMDB_MAP.keys(), key=len, reverse=True):
         if key in low_text:
-            explicit_imdb = imdb
+            explicit_imdb = EXPLICIT_IMDB_MAP[key]
             break
 
     if not explicit_imdb:
@@ -217,7 +257,7 @@ def parse_media_text(raw_text: str):
     return content_type, season, episode, clean_title, explicit_imdb
 
 # =========================================================
-# INTELIGÊNCIA ARTIFICIAL (GEMINI - PROMPT COM TREINAMENTO PREDITIVO)
+# INTELIGÊNCIA ARTIFICIAL (GEMINI - PROMPT COM MODELO CINDERELA E DISNEY)
 # =========================================================
 
 async def ai_analyze_message(text: str, filename: str):
@@ -236,25 +276,28 @@ async def ai_analyze_message(text: str, filename: str):
 
     [MANUAL PREDITIVO DE CATALOGAÇÃO - REGRAS INFALÍVEIS]
     1. DISTINÇÃO LIVE-ACTION vs. DESENHO/ANIMAÇÃO:
+       - "Cinderela" (1950 Animação Clássica = tt0042332 | 2015 Live-Action = tt1661199 | 2021 Musical = tt1016150)
        - "Garfield: O Filme" (2004 Live-Action com atores/CGI) = imdb_id "tt0356634"
        - "Garfield 2" (2006 Live-Action) = imdb_id "tt0463323"
        - "Garfield: Fora de Casa" (2024 Animação) = imdb_id "tt13398158"
        - "O Rei Leão" (1994 Animação = tt0110357 | 2019 Live-Action = tt6105098)
        - "A Pequena Sereia" (1989 Animação = tt0098096 | 2023 Live-Action = tt5971474)
+       - "A Bela e a Fera" (1991 Animação = tt0101414 | 2017 Live-Action = tt2771200)
+       - "Aladdin" (1992 Animação = tt0103639 | 2019 Live-Action = tt6139732)
        - "Pica-Pau: O Filme" (2017 Live-Action = tt2118686)
 
     2. REBOOTS, REMAKES E DIFERENCIAÇÃO POR ANO:
-       - Se houver indicação de ano na legenda (ex: 1984, 2021), use-o para apontar o "imdb_id" correto ou adicione o ano ao "original_title".
+       - Se houver indicação de ano na legenda (ex: 1950, 2015), use-o para apontar o "imdb_id" correto.
 
     3. ANIME E SÉRIES FRACIONADAS:
        - Se houver termos como "Ep 03", "Capítulo 03", "Parte 2", "S01E03", defina obrigatoriamente type="series". Se não houver temporada explícita, defina season=1.
 
     4. TAGS EXPLÍCITAS IMDB:
-       - Se o texto contiver uma tag como [tt16026746] ou tt16026746, retorne este valor exatamente no campo "imdb_id".
+       - Se o texto contiver uma tag como [tt0042332] ou tt0042332, retorne este valor exatamente no campo "imdb_id".
 
     5. HIGIENIZAÇÃO DE TÍTULO PARA CINEMETA:
-       - "title": Título limpo sem qualidade (1080p, 4k), sem tags de grupo (@...) e sem subtítulos em português que dificultem a busca.
-       - "original_title": Título original em inglês (ex: "Cars" para Carros, "Inside Out" para Divertida Mente, "The Dark Knight" para Batman).
+       - "title": Título limpo sem qualidade (1080p, 4k) e sem tags de grupo (@...).
+       - "original_title": Título original em inglês (ex: "Cinderella" para Cinderela, "Cars" para Carros).
 
     Responda EXATAMENTE e APENAS em formato JSON válido:
     {{
@@ -527,9 +570,9 @@ async def reindex_channel():
 def manifest():
     return {
         "id": "org.telaverde.hybrid",
-        "version": "10.0.0",
+        "version": "10.1.0",
         "name": "TelaVerde Ultra Pro",
-        "description": "Telegram Streaming + Trained AI Engine & Precision Quality Tags",
+        "description": "Telegram Streaming + Priority Matcher & Disney Classics Protection",
         "resources": ["stream", "catalog", "meta"],
         "types": ["movie", "series"],
         "idPrefixes": ["tt"],
