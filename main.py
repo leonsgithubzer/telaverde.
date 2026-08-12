@@ -9,6 +9,7 @@ import traceback
 from urllib.parse import quote
 from contextlib import asynccontextmanager
 
+import requests
 import httpx
 from databases import Database
 
@@ -456,7 +457,7 @@ async def reindex_channel():
 def manifest():
     return {
         "id": "org.telaverde.hybrid",
-        "version": "9.0.0",
+        "version": "9.0.1",
         "name": "TelaVerde Ultra Pro",
         "description": "Telegram Streaming + Async HTTPX Engine & Metahub Posters",
         "resources": ["stream", "catalog", "meta"],
@@ -480,7 +481,7 @@ def manifest():
 async def catalog(type: str, catalog_id: str):
     target_type = "movie" if type == "movie" else "series"
     rows = await database.fetch_all(
-        f"""
+        """
         SELECT DISTINCT ON (imdb_id)
             imdb_id, title
         FROM entries
@@ -571,7 +572,6 @@ async def stream_handler(type: str, stremio_id: str):
     streams = []
     for idx, row in enumerate(rows):
         msg_id = row["message_id"]
-        # Busca o texto do Telegram para extrair tags de qualidade
         try:
             msg = await client.get_messages(CHANNEL_ID, ids=msg_id)
             raw_info = f"{msg.text or ''} {getattr(msg.file, 'name', '') or ''}"
@@ -612,7 +612,8 @@ async def stream_handler(type: str, stremio_id: str):
 
     return {"streams": []}
 
-@app.route("/video/{message_id}", methods=["GET", "HEAD"])
+# ROTA DE VÍDEO COMPATÍVEL COM FASTAPI (GET E HEAD)
+@app.api_route("/video/{message_id}", methods=["GET", "HEAD"])
 async def video_proxy(request: Request, message_id: int):
     try:
         msg = await client.get_messages(CHANNEL_ID, ids=message_id)
@@ -642,7 +643,7 @@ async def video_proxy(request: Request, message_id: int):
             "Cache-Control": "public, max-age=3600"
         }
 
-        # Trata requisições HEAD (usadas por Smart TVs e Stremio Web)
+        # Trata requisições HEAD (Smart TVs e Stremio Web)
         if request.method == "HEAD":
             return Response(status_code=206, headers=headers)
 
