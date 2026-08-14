@@ -35,7 +35,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 FIMOO_API_URL = "https://fenixflix-search.vercel.app/search"
 
-# CHUNK SIZE OTIMIZADO PARA 512KB (PREVINE ESTOURO DE RAM NO RENDER)
+# CHUNK SIZE OTIMIZADO PARA 512KB (PREVINE ESTOURO DE RAM)
 CHUNK_SIZE = 1024 * 512
 
 # MAPA LOCAL DE PROTEÇÃO CONTRA CONFUSÕES CLÁSSICAS
@@ -473,14 +473,16 @@ async def lifespan(app: FastAPI):
     await client.disconnect()
 
 # =========================================================
-# INSTÂNCIA FASTAPI
+# INSTÂNCIA FASTAPI & CONFIGURAÇÃO DE CORS E ROTEAMENTO
 # =========================================================
 
 app = FastAPI(lifespan=lifespan)
 
+# Suporte universal de CORS para o Stremio e navegadores
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
 )
@@ -489,8 +491,9 @@ app.add_middleware(
 # ENDPOINTS
 # =========================================================
 
-@app.get("/")
-@app.get("//")
+# Aceita GET, OPTIONS e HEAD na raiz para resolver o erro 405 do Back4App e do Stremio
+@app.api_route("/", methods=["GET", "OPTIONS", "HEAD"])
+@app.api_route("//", methods=["GET", "OPTIONS", "HEAD"])
 async def root():
     return {
         "status": "online",
