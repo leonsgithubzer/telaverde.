@@ -13,7 +13,7 @@ import requests
 import httpx
 from databases import Database
 
-from fastapi import FastAPI, Header, Response, Request
+from fastapi import FastAPI, Header, Response, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -35,7 +35,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 FIMOO_API_URL = "https://fenixflix-search.vercel.app/search"
 
-# CHUNK SIZE OTIMIZADO PARA 512KB (PREVINE ESTOURO DE RAM)
+# CHUNK SIZE OTIMIZADO PARA 512KB (ECONOMIZA MEMÓRIA RAM)
 CHUNK_SIZE = 1024 * 512
 
 # MAPA LOCAL DE PROTEÇÃO CONTRA CONFUSÕES CLÁSSICAS
@@ -141,7 +141,7 @@ database = Database(
 )
 
 # =========================================================
-# INICIALIZAÇÃO DA TABELA (COM AUTO MIGRATION DE QUALIDADE)
+# INICIALIZAÇÃO DA TABELA
 # =========================================================
 
 async def init_db():
@@ -160,7 +160,6 @@ async def init_db():
     """
     await database.execute(query=query)
 
-    # Adiciona a coluna quality se o banco já existir sem ela
     try:
         await database.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS quality TEXT DEFAULT '1080p';")
     except Exception:
@@ -386,7 +385,7 @@ async def search_cinemeta(query_name: str, content_type: str, explicit_imdb: str
     return None, None
 
 # =========================================================
-# PROCESSADOR DE MENSAGEM (COM SALVAMENTO DE QUALIDADE NO BANCO)
+# PROCESSADOR DE MENSAGEM
 # =========================================================
 
 async def process_and_save_message(msg):
@@ -400,9 +399,7 @@ async def process_and_save_message(msg):
     if not full_raw_text:
         return False, None
 
-    # Extrai a tag de qualidade no momento do cadastro
     quality = extract_quality_tags(full_raw_text)
-
     content_type, season, episode, query_name, explicit_imdb = parse_media_text(full_raw_text)
     imdb_id, title = await search_cinemeta(query_name, content_type, explicit_imdb)
 
@@ -444,7 +441,7 @@ async def process_and_save_message(msg):
     return True, title
 
 # =========================================================
-# AUTO INDEXAÇÃO
+# AUTO INDEXAÇÃO EM TEMPO REAL
 # =========================================================
 
 @client.on(events.NewMessage(chats=CHANNEL_ID))
@@ -452,11 +449,41 @@ async def auto_index(event):
     try:
         success, info = await process_and_save_message(event)
         if success:
-            print(f"[AUTO INDEX] Sucesso: {info}")
+            print(f"[AUTO INDEX] Novo item indexado: {info}")
         else:
-            print(f"[AUTO INDEX] Falha: {info}")
+            print(f"[AUTO INDEX] Falha na identificação: {info}")
     except Exception:
         print(traceback.format_exc())
+
+# =========================================================
+# TAREFA EM SEGUNDO PLANO PARA REINDEXAÇÃO
+# =========================================================
+
+async def task_reindex_channel():
+    print("========================================")
+    print(">>> [REINDEX] INICIANDO VARREDURA NO TELEGRAM <<<")
+    print("========================================")
+    count = 0
+    errors = []
+
+    try:
+        async for msg in client.iter_messages(CHANNEL_ID):
+            try:
+                success, info = await process_and_save_message(msg)
+                if success:
+                    count += 1
+                    print(f"[REINDEX] ({count}) Sincronizado com sucesso: {info}")
+                elif info:
+                    errors.append(info)
+            except Exception as e:
+                print(f"[REINDEX] Erro ao ler mensagem {msg.id}: {str(e)}")
+                continue
+
+        print("========================================")
+        print(f">>> [REINDEX] CONCLUÍDO! Total de mídias indexadas: {count} <<<")
+        print("========================================")
+    except Exception as e:
+        print(f"[REINDEX] Erro geral na execução: {str(e)}")
 
 # =========================================================
 # CICLO DE VIDA FASTAPI
@@ -473,12 +500,11 @@ async def lifespan(app: FastAPI):
     await client.disconnect()
 
 # =========================================================
-# INSTÂNCIA FASTAPI & CONFIGURAÇÃO DE CORS E ROTEAMENTO
+# INSTÂNCIA FASTAPI & CORS
 # =========================================================
 
 app = FastAPI(lifespan=lifespan)
 
-# Suporte universal de CORS para o Stremio e navegadores
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -491,7 +517,6 @@ app.add_middleware(
 # ENDPOINTS
 # =========================================================
 
-# Aceita GET, OPTIONS e HEAD na raiz para resolver o erro 405 do Back4App e do Stremio
 @app.api_route("/", methods=["GET", "OPTIONS", "HEAD"])
 @app.api_route("//", methods=["GET", "OPTIONS", "HEAD"])
 async def root():
@@ -499,6 +524,18 @@ async def root():
         "status": "online",
         "telegram_connected": client.is_connected(),
         "ai_enabled": bool(GEMINI_API_KEY)
+    }
+
+@app.get("/reindex")
+@app.get("/reindex/")
+async def reindex_channel(background_tasks: BackgroundTasks):
+    """
+    Inicia a varredura completa do canal em background sem travar a requisição HTTP.
+    """
+    background_tasks.add_task(task_reindex_channel)
+    return {
+        "status": "iniciado",
+        "message": "Reindexação iniciada em segundo plano! Acompanhe o progresso em tempo real nos logs do Back4App."
     }
 
 @app.get("/list")
@@ -538,29 +575,6 @@ async def fix_entry(message_id: int, season: int, episode: int):
         "message_id": message_id,
         "nova_temporada": season,
         "novo_episodio": episode
-    }
-
-@app.get("/reindex")
-@app.get("/reindex/")
-async def reindex_channel():
-    count = 0
-    errors = []
-
-    async for msg in client.iter_messages(CHANNEL_ID):
-        try:
-            success, info = await process_and_save_message(msg)
-            if success:
-                count += 1
-            elif info:
-                errors.append(info)
-        except Exception as e:
-            print(f"Erro ao processar mensagem {msg.id}: {str(e)}")
-            continue
-
-    return {
-        "status": "concluido",
-        "novos_itens_indexados": count,
-        "arquivos_nao_encontrados": errors
     }
 
 @app.get("/manifest.json")
@@ -657,7 +671,7 @@ async def meta(type: str, imdb_id: str):
     }
 
 # =========================================================
-# STREAMING ULTRA-RÁPIDO (LEITURA DIRETA DO SUPABASE)
+# STREAMING (SUPABASE)
 # =========================================================
 
 @app.get("/stream/{type}/{stremio_id}.json")
