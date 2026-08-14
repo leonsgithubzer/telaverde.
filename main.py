@@ -5,6 +5,7 @@
 import os
 import re
 import json
+import asyncio
 import traceback
 from urllib.parse import quote
 from contextlib import asynccontextmanager
@@ -472,32 +473,54 @@ async def task_reindex_channel():
                 success, info = await process_and_save_message(msg)
                 if success:
                     count += 1
-                    print(f"[REINDEX] ({count}) Sincronizado com sucesso: {info}")
+                    print(f"[REINDEX] ({count}) Sincronizado: {info}")
                 elif info:
                     errors.append(info)
             except Exception as e:
-                print(f"[REINDEX] Erro ao ler mensagem {msg.id}: {str(e)}")
+                print(f"[REINDEX] Erro na mensagem {msg.id}: {str(e)}")
                 continue
 
         print("========================================")
-        print(f">>> [REINDEX] CONCLUÍDO! Total de mídias indexadas: {count} <<<")
+        print(f">>> [REINDEX] CONCLUÍDO! Total: {count} mídias indexadas <<<")
         print("========================================")
     except Exception as e:
-        print(f"[REINDEX] Erro geral na execução: {str(e)}")
+        print(f"[REINDEX] Erro geral: {str(e)}")
 
 # =========================================================
-# CICLO DE VIDA FASTAPI
+# INICIALIZAÇÃO RESILIENTE (ABRE A PORTA 7860 IMEDIATAMENTE)
 # =========================================================
+
+async def connect_services():
+    try:
+        print(">>> CONECTANDO AO BANCO DE DADOS... <<<")
+        await database.connect()
+        await init_db()
+        print(">>> BANCO DE DADOS CONECTADO COM SUCESSO <<<")
+    except Exception as e:
+        print(f"[ERRO DB] Falha na conexão com Supabase: {e}")
+
+    try:
+        print(">>> CONECTANDO AO TELEGRAM... <<<")
+        await client.connect()
+        print(">>> SERVIÇO TELAVERDE CONECTADO AO TELEGRAM <<<")
+    except Exception as e:
+        print(f"[ERRO TELEGRAM] Falha na conexão com Telethon: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await database.connect()
-    await init_db()
-    await client.start()
-    print(">>> SERVIÇO TELAVERDE CONECTADO <<<")
+    # Inicia conexões em segundo plano para não bloquear a porta 7860
+    asyncio.create_task(connect_services())
     yield
-    await database.disconnect()
-    await client.disconnect()
+    try:
+        if database.is_connected:
+            await database.disconnect()
+    except Exception:
+        pass
+    try:
+        if client.is_connected():
+            await client.disconnect()
+    except Exception:
+        pass
 
 # =========================================================
 # INSTÂNCIA FASTAPI & CORS
@@ -529,13 +552,10 @@ async def root():
 @app.get("/reindex")
 @app.get("/reindex/")
 async def reindex_channel(background_tasks: BackgroundTasks):
-    """
-    Inicia a varredura completa do canal em background sem travar a requisição HTTP.
-    """
     background_tasks.add_task(task_reindex_channel)
     return {
         "status": "iniciado",
-        "message": "Reindexação iniciada em segundo plano! Acompanhe o progresso em tempo real nos logs do Back4App."
+        "message": "Reindexação iniciada em segundo plano! Acompanhe nos logs do Back4App."
     }
 
 @app.get("/list")
